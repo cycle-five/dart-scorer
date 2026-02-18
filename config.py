@@ -116,7 +116,13 @@ MAX_BLOB_AREA = 8000  # pixels²
 # Number of consecutive frames a candidate blob must appear in before it is
 # accepted as a real dart.  Wire noise can persist for a few frames due to
 # camera auto-exposure adjustments, so require more frames.
-PERSISTENCE_FRAMES = 6  # frames
+PERSISTENCE_FRAMES = 4  # frames
+
+# Maximum distance (pixels) between blob centroids to merge them into one
+# dart.  Dart shafts and flights often appear as separate blobs; merging
+# prevents double-counting and ensures the tip is found on the shaft, not
+# the flight.
+BLOB_MERGE_DISTANCE = 100  # pixels
 
 # Number of frames kept in the rolling buffer used to compute the median
 # background image.  Larger values produce a more stable background at the

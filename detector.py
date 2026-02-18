@@ -105,7 +105,11 @@ class DartDetector:
         return mask
 
     def find_blobs(self, mask):
-        """Find contours in the diff mask that fall within the valid blob area range.
+        """Find contours in the diff mask, merge nearby ones, and filter by area.
+
+        Dart shafts and flights often produce separate blobs in the diff mask.
+        This method merges blobs whose centroids are within BLOB_MERGE_DISTANCE
+        so that each physical dart becomes a single blob with a correct tip.
 
         Args:
             mask: Binary uint8 mask from get_diff_mask.
@@ -115,22 +119,67 @@ class DartDetector:
                              "bbox": (x, y, w, h), "area": area}, ...]
         """
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        blobs = []
+
+        # Build raw blob list (no area filter yet — small fragments get merged)
+        raw = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if not (config.MIN_BLOB_AREA <= area <= config.MAX_BLOB_AREA):
+            if area < 20:  # skip single-pixel noise
                 continue
             M = cv2.moments(cnt)
             if M["m00"] == 0:
                 continue
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
-            bbox = cv2.boundingRect(cnt)
+            raw.append({"contour": cnt, "centroid": (cx, cy), "area": area})
+
+        # Merge nearby blobs using union-find
+        n = len(raw)
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            pi, pj = find(i), find(j)
+            if pi != pj:
+                parent[pi] = pj
+
+        merge_dist = config.BLOB_MERGE_DISTANCE
+        for i in range(n):
+            for j in range(i + 1, n):
+                ci = raw[i]["centroid"]
+                cj = raw[j]["centroid"]
+                dist = ((ci[0] - cj[0]) ** 2 + (ci[1] - cj[1]) ** 2) ** 0.5
+                if dist < merge_dist:
+                    union(i, j)
+
+        # Group by root and combine contours
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i in range(n):
+            groups[find(i)].append(i)
+
+        blobs = []
+        for indices in groups.values():
+            merged_cnt = np.vstack([raw[i]["contour"] for i in indices])
+            total_area = sum(raw[i]["area"] for i in indices)
+            if not (config.MIN_BLOB_AREA <= total_area <= config.MAX_BLOB_AREA):
+                continue
+            M = cv2.moments(merged_cnt)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            bbox = cv2.boundingRect(merged_cnt)
             blobs.append({
-                "contour": cnt,
+                "contour": merged_cnt,
                 "centroid": (cx, cy),
                 "bbox": bbox,
-                "area": area,
+                "area": total_area,
             })
         return blobs
 
@@ -153,11 +202,25 @@ class DartDetector:
         idx = int(np.argmin(dists))
         return (int(pts[idx, 0]), int(pts[idx, 1]))
 
+    def _near_confirmed(self, tip, radius=60):
+        """Check if a tip is near any already-confirmed dart.
+
+        Returns the blob_id of the nearby confirmed dart, or None.
+        """
+        tx, ty = tip
+        for cid, dart in self.confirmed_darts.items():
+            dx, dy = dart["tip"]
+            if ((tx - dx) ** 2 + (ty - dy) ** 2) ** 0.5 < radius:
+                return cid
+        return None
+
     def match_blobs(self, current_blobs):
         """Match current blobs to existing candidates and yield newly confirmed darts.
 
-        Updates candidate_blobs in place. Candidates that have been seen for at
-        least PERSISTENCE_FRAMES consecutive frames are promoted to confirmed_darts.
+        Uses a two-stage approach:
+        1. Match current blobs to candidates by centroid proximity.
+        2. Before yielding a "new" dart, dedup against confirmed_darts by tip
+           proximity so that tracking instability doesn't cause re-detections.
 
         Args:
             current_blobs: List of blob dicts from find_blobs.
@@ -166,18 +229,20 @@ class DartDetector:
             Dict {"tip": (x, y), "blob_id": int, "bbox": (x, y, w, h)} for each
             newly confirmed dart.
         """
-        MATCH_DISTANCE = 50  # pixels
+        # Use a generous match distance — merged blob centroids shift a lot
+        MATCH_DISTANCE = 100  # pixels
 
         matched_candidate_ids = set()
-        matched_blob_indices = set()
 
-        # Match current blobs to existing candidates
-        for blob_idx, blob in enumerate(current_blobs):
+        # First try to match each blob to an existing candidate
+        for blob in current_blobs:
             bx, by = blob["centroid"]
             best_id = None
             best_dist = MATCH_DISTANCE
 
             for cid, cand in self.candidate_blobs.items():
+                if cid in matched_candidate_ids:
+                    continue  # already claimed this frame
                 cx, cy = cand["centroid"]
                 dist = ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5
                 if dist < best_dist:
@@ -191,38 +256,46 @@ class DartDetector:
                 cand["tip"] = blob.get("tip", blob["centroid"])
                 cand["bbox"] = blob["bbox"]
                 matched_candidate_ids.add(best_id)
-                matched_blob_indices.add(blob_idx)
             else:
-                # New candidate
+                # New candidate — but only if not near a confirmed dart
+                tip = blob.get("tip", blob["centroid"])
+                if self._near_confirmed(tip) is not None:
+                    continue  # already known dart, skip
                 new_id = self.next_blob_id
                 self.next_blob_id += 1
                 self.candidate_blobs[new_id] = {
                     "centroid": blob["centroid"],
                     "frames_seen": 1,
-                    "tip": blob.get("tip", blob["centroid"]),
+                    "frames_missed": 0,
+                    "tip": tip,
                     "bbox": blob["bbox"],
                 }
-                matched_blob_indices.add(blob_idx)
 
-        # Remove candidates not seen this frame
-        gone = [cid for cid in self.candidate_blobs if cid not in matched_candidate_ids
-                and not any(
-                    ((self.candidate_blobs[cid]["centroid"][0] - b["centroid"][0]) ** 2 +
-                     (self.candidate_blobs[cid]["centroid"][1] - b["centroid"][1]) ** 2) ** 0.5 < MATCH_DISTANCE
-                    for b in current_blobs
-                )]
+        # Allow candidates a grace period of 3 missed frames before removal
+        gone = []
+        for cid in self.candidate_blobs:
+            if cid not in matched_candidate_ids:
+                self.candidate_blobs[cid]["frames_missed"] += 1
+                if self.candidate_blobs[cid]["frames_missed"] > 3:
+                    gone.append(cid)
+            else:
+                self.candidate_blobs[cid]["frames_missed"] = 0
         for cid in gone:
             del self.candidate_blobs[cid]
 
         # Promote persistent candidates to confirmed darts
         for cid, cand in list(self.candidate_blobs.items()):
             if cand["frames_seen"] >= config.PERSISTENCE_FRAMES and cid not in self.confirmed_darts:
+                tip = cand["tip"]
+                # Final dedup: don't promote if near an existing confirmed dart
+                if self._near_confirmed(tip) is not None:
+                    continue
                 self.confirmed_darts[cid] = {
-                    "tip": cand["tip"],
+                    "tip": tip,
                     "bbox": cand["bbox"],
                     "blob_id": cid,
                 }
-                yield {"tip": cand["tip"], "blob_id": cid, "bbox": cand["bbox"]}
+                yield {"tip": tip, "blob_id": cid, "bbox": cand["bbox"]}
 
     def process_frame(self, frame):
         """Main entry point. Process one undistorted BGR frame.
