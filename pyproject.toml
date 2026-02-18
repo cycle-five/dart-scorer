@@ -1,0 +1,9 @@
+[project]
+name = "dartscorer"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4.2",
+    "opencv-contrib-python>=4.13.0.92",
+]
