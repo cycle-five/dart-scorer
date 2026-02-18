@@ -90,15 +90,18 @@ class DartDetector:
         if self.background is None:
             return None
         # Blur both frames to suppress wire detail and sensor noise
-        bg_blur = cv2.GaussianBlur(self.background, (9, 9), 0)
-        fr_blur = cv2.GaussianBlur(gray_frame, (9, 9), 0)
+        bk = config.BLUR_KSIZE
+        bg_blur = cv2.GaussianBlur(self.background, (bk, bk), 0)
+        fr_blur = cv2.GaussianBlur(gray_frame, (bk, bk), 0)
         diff = cv2.absdiff(bg_blur, fr_blur)
         _, thresh = cv2.threshold(diff, config.DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
         # Opening removes small noise specks (wire glints)
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        ok = config.OPEN_KSIZE
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ok, ok))
         mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open)
         # Closing fills gaps within dart-shaped blobs
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        ck = config.CLOSE_KSIZE
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ck, ck))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
         if self.debug:
             cv2.imshow("Diff Mask", mask)

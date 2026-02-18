@@ -124,6 +124,18 @@ PERSISTENCE_FRAMES = 4  # frames
 # the flight.
 BLOB_MERGE_DISTANCE = 100  # pixels
 
+# Gaussian blur kernel size (must be odd).  Applied to both background and
+# current frame before differencing to suppress wire detail and sensor noise.
+BLUR_KSIZE = 9
+
+# Morphological opening kernel size (must be odd).  Removes small noise
+# speckles (wire glints) from the diff mask.
+OPEN_KSIZE = 5
+
+# Morphological closing kernel size (must be odd).  Fills gaps within
+# dart-shaped blobs in the diff mask.
+CLOSE_KSIZE = 11
+
 # Number of frames kept in the rolling buffer used to compute the median
 # background image.  Larger values produce a more stable background at the
 # cost of slower adaptation to slow illumination changes.
