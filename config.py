@@ -102,16 +102,16 @@ SECTOR_ORDER = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 
 # Minimum per-pixel intensity difference (0–255) between the current frame
 # and the background model for a pixel to be classified as "changed".
 # Raised from 30 to reject wire reflections and camera sensor noise.
-DIFF_THRESHOLD = 41
+DIFF_THRESHOLD = 46
 
 # Minimum contour area in pixels for a detected blob to be considered a
 # potential dart tip.  At 1080p a dart shaft produces a blob of ~300–2000 px²;
 # wire glints are typically < 200 px².
-MIN_BLOB_AREA = 75  # pixels²
+MIN_BLOB_AREA = 400  # pixels²
 
 # Maximum contour area in pixels; blobs larger than this are rejected as
 # environmental noise or large motion events (e.g. a hand passing through)
-MAX_BLOB_AREA = 6500  # pixels²
+MAX_BLOB_AREA = 20000  # pixels²
 
 # Number of consecutive frames a candidate blob must appear in before it is
 # accepted as a real dart.  Wire noise can persist for a few frames due to
@@ -122,19 +122,19 @@ PERSISTENCE_FRAMES = 4  # frames
 # dart.  Dart shafts and flights often appear as separate blobs; merging
 # prevents double-counting and ensures the tip is found on the shaft, not
 # the flight.
-BLOB_MERGE_DISTANCE = 140  # pixels
+BLOB_MERGE_DISTANCE = 200  # pixels
 
 # Gaussian blur kernel size (must be odd).  Applied to both background and
 # current frame before differencing to suppress wire detail and sensor noise.
-BLUR_KSIZE = 3
+BLUR_KSIZE = 7
 
 # Morphological opening kernel size (must be odd).  Removes small noise
 # speckles (wire glints) from the diff mask.
-OPEN_KSIZE = 9
+OPEN_KSIZE = 5
 
 # Morphological closing kernel size (must be odd).  Fills gaps within
 # dart-shaped blobs in the diff mask.
-CLOSE_KSIZE = 17
+CLOSE_KSIZE = 15
 
 # Number of frames kept in the rolling buffer used to compute the median
 # background image.  Larger values produce a more stable background at the
