@@ -196,36 +196,85 @@ def score_detections(detected_tips, ground_truth_tips, match_radius=30):
 # Optuna objective
 # ---------------------------------------------------------------------------
 
-def make_objective(annotations, img_dir, background_frames, board_center):
-    """Create an Optuna objective function closed over the dataset."""
+def _group_into_rounds(annotations, img_dir):
+    """Group annotations into rounds of sequential throws.
 
-    # Preload all labeled frames with darts
-    labeled = []
-    for entry in annotations:
-        if entry.get("is_background", False):
-            continue
-        if entry.get("n_darts", 0) == 0:
-            continue
+    A round starts with a background/0-dart frame and contains subsequent
+    frames with increasing dart counts.  Each round represents one set of
+    throws before darts are pulled.
+
+    Returns list of rounds, where each round is a list of
+    {"gray": ndarray, "tips": [(x,y),...], "n_darts": int} sorted by n_darts.
+    """
+    # Sort by timestamp to get capture order
+    sorted_ann = sorted(annotations, key=lambda a: a.get("timestamp", 0))
+
+    rounds = []
+    current_round = []
+
+    for entry in sorted_ann:
         path = img_dir / entry["filename"]
         img = cv2.imread(str(path))
         if img is None:
             continue
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        tips = [tuple(t) for t in entry["tips"]]
-        labeled.append({"gray": gray, "tips": tips, "n_darts": entry["n_darts"]})
+        n = entry.get("n_darts", 0)
+        tips = [tuple(t) for t in entry.get("tips", [])]
 
-    # Also load background-only frames for false positive evaluation
-    bg_only = []
-    for entry in annotations:
-        if entry.get("n_darts", 0) == 0:
-            path = img_dir / entry["filename"]
-            img = cv2.imread(str(path))
-            if img is None:
+        if n == 0:
+            # Background frame — start a new round
+            if current_round:
+                rounds.append(current_round)
+            current_round = [{"gray": gray, "tips": tips, "n_darts": 0}]
+        else:
+            if not current_round:
+                # No background yet — skip orphaned dart frames
                 continue
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            bg_only.append(gray)
+            current_round.append({"gray": gray, "tips": tips, "n_darts": n})
 
-    print(f"Loaded {len(labeled)} frames with darts, {len(bg_only)} background frames")
+    if current_round:
+        rounds.append(current_round)
+
+    return rounds
+
+
+def _find_new_tips(prev_tips, curr_tips, radius=40):
+    """Find tips in curr_tips that aren't near any tip in prev_tips."""
+    new = []
+    for (cx, cy) in curr_tips:
+        is_old = False
+        for (px, py) in prev_tips:
+            if ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5 < radius:
+                is_old = True
+                break
+        if not is_old:
+            new.append((cx, cy))
+    return new
+
+
+def make_objective(annotations, img_dir, background_frames, board_center):
+    """Create an Optuna objective function using sequential evaluation.
+
+    Simulates real play: for each round of throws, the background starts
+    as the empty board and is updated after each detected dart, so the
+    detector only needs to find the ONE new dart per frame.
+    """
+    rounds = _group_into_rounds(annotations, img_dir)
+
+    total_gt_tips = 0
+    total_frames = 0
+    for r in rounds:
+        for item in r:
+            if item["n_darts"] > 0:
+                total_frames += 1
+        # Count new tips per step
+        prev_tips = []
+        for item in r:
+            new = _find_new_tips(prev_tips, item["tips"])
+            total_gt_tips += len(new)
+            prev_tips = item["tips"]
+
+    print(f"Loaded {len(rounds)} rounds, {total_frames} frames with darts, {total_gt_tips} new-dart events")
 
     def objective(trial):
         params = {
@@ -238,54 +287,58 @@ def make_objective(annotations, img_dir, background_frames, board_center):
             "merge_distance": trial.suggest_int("merge_distance", 40, 200, step=10),
         }
 
-        # Build background with this blur setting
-        bg_median = build_background(img_dir, annotations, params["blur_ksize"])
-        if bg_median is None:
-            return -1.0
-
         total_tp = 0
         total_fp = 0
         total_fn = 0
         total_err = 0.0
         n_matched = 0
 
-        # Evaluate on frames with darts
-        for item in labeled:
-            detected = detect_tips_static(
-                item["gray"], bg_median, board_center, params
-            )
-            tp, fp, fn, mean_err = score_detections(
-                detected, item["tips"], match_radius=40
-            )
-            total_tp += tp
-            total_fp += fp
-            total_fn += fn
-            if tp > 0:
-                total_err += mean_err * tp
-                n_matched += tp
+        for rnd in rounds:
+            # First frame in round should be background (or use it to init)
+            background = rnd[0]["gray"].copy()
+            prev_tips = rnd[0]["tips"]  # usually empty
 
-        # Evaluate false positives on background frames
-        for gray in bg_only:
-            detected = detect_tips_static(
-                gray, bg_median, board_center, params
-            )
-            total_fp += len(detected)
+            for item in rnd[1:]:
+                # What's new in this frame?
+                new_gt_tips = _find_new_tips(prev_tips, item["tips"])
+                if not new_gt_tips and item["n_darts"] == prev_tips.__len__():
+                    # No new darts, skip (duplicate frame)
+                    prev_tips = item["tips"]
+                    continue
+
+                # Detect against current background
+                detected = detect_tips_static(
+                    item["gray"], background, board_center, params
+                )
+
+                # Score only the NEW tips (not all tips in frame)
+                tp, fp, fn, mean_err = score_detections(
+                    detected, new_gt_tips, match_radius=40
+                )
+                total_tp += tp
+                total_fp += fp
+                total_fn += fn
+                if tp > 0:
+                    total_err += mean_err * tp
+                    n_matched += tp
+
+                # Absorb: update background to current frame (simulates absorb_current_scene)
+                background = item["gray"].copy()
+                prev_tips = item["tips"]
 
         # F1-based score with error penalty
         precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
         recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
-        # Penalize positional error (lower is better)
+        # Penalize positional error
         mean_error = total_err / n_matched if n_matched > 0 else 40.0
-        error_penalty = max(0, 1.0 - mean_error / 40.0)  # 0 at 40px, 1 at 0px
+        error_penalty = max(0, 1.0 - mean_error / 40.0)
 
-        # Combined score: 80% F1, 20% accuracy
         score = 0.8 * f1 + 0.2 * error_penalty
-
         return score
 
-    return objective, len(labeled)
+    return objective, total_frames
 
 
 # ---------------------------------------------------------------------------
@@ -406,31 +459,28 @@ def main():
     for key, value in sorted(best.params.items()):
         print(f"  {key:20s} = {value}")
 
-    # Run final evaluation with best params to show detailed metrics
-    bg_median = build_background(img_dir, annotations, best.params["blur_ksize"])
+    # Run final sequential evaluation with best params
+    rounds = _group_into_rounds(annotations, img_dir)
     total_tp = total_fp = total_fn = 0
-    for entry in annotations:
-        if entry.get("n_darts", 0) == 0:
-            # Check false positives on empty frames
-            path = img_dir / entry["filename"]
-            img = cv2.imread(str(path))
-            if img is None:
+    for rnd in rounds:
+        background = rnd[0]["gray"].copy()
+        prev_tips = rnd[0]["tips"]
+        for item in rnd[1:]:
+            new_gt_tips = _find_new_tips(prev_tips, item["tips"])
+            if not new_gt_tips and item["n_darts"] == len(prev_tips):
+                prev_tips = item["tips"]
                 continue
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            detected = detect_tips_static(gray, bg_median, board_center, best.params)
-            total_fp += len(detected)
-        else:
-            path = img_dir / entry["filename"]
-            img = cv2.imread(str(path))
-            if img is None:
-                continue
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            tips = [tuple(t) for t in entry["tips"]]
-            detected = detect_tips_static(gray, bg_median, board_center, best.params)
-            tp, fp, fn, _ = score_detections(detected, tips, match_radius=args.match_radius)
+            detected = detect_tips_static(
+                item["gray"], background, board_center, best.params
+            )
+            tp, fp, fn, _ = score_detections(
+                detected, new_gt_tips, match_radius=args.match_radius
+            )
             total_tp += tp
             total_fp += fp
             total_fn += fn
+            background = item["gray"].copy()
+            prev_tips = item["tips"]
 
     precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
     recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0

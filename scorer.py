@@ -208,13 +208,14 @@ def main():
                         log_detection(score_info, tip, game_mode,
                                      game.remaining if game else None)
 
+                    # Absorb current scene so next detection only sees NEW darts
+                    detector.absorb_current_scene(gray)
                     state = State.WAITING_FOR_REMOVAL
 
             elif state == State.WAITING_FOR_REMOVAL:
-                # Still run detection to track existing darts
+                # Still run detection to catch additional darts
                 detections = detector.process_frame(undistorted)
 
-                # Also check for new darts while waiting
                 if detections:
                     for det in detections:
                         tip = det['tip']
@@ -234,6 +235,9 @@ def main():
 
                         log_detection(score_info, tip, game_mode,
                                      game.remaining if game else None)
+
+                    # Absorb again after new darts detected
+                    detector.absorb_current_scene(gray)
 
                 # Check if all darts removed
                 removed = detector.dart_removed(gray)

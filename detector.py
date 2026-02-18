@@ -346,6 +346,22 @@ class DartDetector:
 
         return new_detections
 
+    def absorb_current_scene(self, gray_frame):
+        """Reset background to current scene so confirmed darts become part of it.
+
+        Call this after a dart is confirmed and scored. The next diff will only
+        show changes from this point forward, making it easy to detect the
+        next dart against "board + existing darts" rather than the empty board.
+
+        Args:
+            gray_frame: Current grayscale frame (with darts in place).
+        """
+        self.bg_buffer = [gray_frame.copy() for _ in range(config.BACKGROUND_HISTORY // 2)]
+        self.background = gray_frame.copy()
+        self.cooldown_counter = 0
+        self.candidate_blobs = {}
+        # Keep confirmed_darts so dedup still works
+
     def dart_removed(self, gray_frame):
         """Check if any confirmed dart has been removed from the board.
 
