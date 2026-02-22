@@ -199,18 +199,23 @@ def score_detections(detected_tips, ground_truth_tips, match_radius=30):
 def _group_into_rounds(annotations, img_dir):
     """Group annotations into rounds of sequential throws.
 
-    A round starts with a background/0-dart frame and contains subsequent
-    frames with increasing dart counts.  Each round represents one set of
-    throws before darts are pulled.
+    A round starts when dart count resets (drops to 0, or decreases from
+    previous frame indicating darts were pulled).  Each round is a sequence
+    of frames with non-decreasing dart counts.
+
+    Handles common collection patterns:
+    - With backgrounds: 0 → 1 → 2 → 3 → 0 → 1 → 2 → 3
+    - Without backgrounds: 1 → 2 → 3 → 1 → 2 → 3 (most common)
 
     Returns list of rounds, where each round is a list of
-    {"gray": ndarray, "tips": [(x,y),...], "n_darts": int} sorted by n_darts.
+    {"gray": ndarray, "tips": [(x,y),...], "n_darts": int}.
     """
     # Sort by timestamp to get capture order
     sorted_ann = sorted(annotations, key=lambda a: a.get("timestamp", 0))
 
     rounds = []
     current_round = []
+    prev_n = -1
 
     for entry in sorted_ann:
         path = img_dir / entry["filename"]
@@ -221,16 +226,18 @@ def _group_into_rounds(annotations, img_dir):
         n = entry.get("n_darts", 0)
         tips = [tuple(t) for t in entry.get("tips", [])]
 
-        if n == 0:
-            # Background frame — start a new round
+        item = {"gray": gray, "tips": tips, "n_darts": n}
+
+        if n < prev_n or (n == 0 and prev_n == 0):
+            # Dart count decreased (darts pulled) or consecutive backgrounds
+            # — start a new round
             if current_round:
                 rounds.append(current_round)
-            current_round = [{"gray": gray, "tips": tips, "n_darts": 0}]
+            current_round = [item]
         else:
-            if not current_round:
-                # No background yet — skip orphaned dart frames
-                continue
-            current_round.append({"gray": gray, "tips": tips, "n_darts": n})
+            current_round.append(item)
+
+        prev_n = n
 
     if current_round:
         rounds.append(current_round)
@@ -301,7 +308,7 @@ def make_objective(annotations, img_dir, background_frames, board_center):
             for item in rnd[1:]:
                 # What's new in this frame?
                 new_gt_tips = _find_new_tips(prev_tips, item["tips"])
-                if not new_gt_tips and item["n_darts"] == prev_tips.__len__():
+                if not new_gt_tips and item["n_darts"] == len(prev_tips):
                     # No new darts, skip (duplicate frame)
                     prev_tips = item["tips"]
                     continue
