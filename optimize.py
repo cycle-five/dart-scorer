@@ -222,10 +222,15 @@ def _group_into_rounds(annotations, img_dir, inject_backgrounds=False):
             if img is not None:
                 bg_grays.append(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
 
-    # Build a median background if we have multiple
+    # Build a median background if we have multiple (filter to most common size)
     bg_inject = None
     if bg_grays:
-        bg_inject = np.median(np.array(bg_grays), axis=0).astype(np.uint8)
+        from collections import Counter
+        sizes = [g.shape for g in bg_grays]
+        most_common_size = Counter(sizes).most_common(1)[0][0]
+        bg_same = [g for g in bg_grays if g.shape == most_common_size]
+        if bg_same:
+            bg_inject = np.median(np.array(bg_same), axis=0).astype(np.uint8)
 
     rounds = []
     current_round = []
