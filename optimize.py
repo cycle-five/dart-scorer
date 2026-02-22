@@ -196,22 +196,36 @@ def score_detections(detected_tips, ground_truth_tips, match_radius=30):
 # Optuna objective
 # ---------------------------------------------------------------------------
 
-def _group_into_rounds(annotations, img_dir):
+def _group_into_rounds(annotations, img_dir, inject_backgrounds=False):
     """Group annotations into rounds of sequential throws.
 
     A round starts when dart count resets (drops to 0, or decreases from
     previous frame indicating darts were pulled).  Each round is a sequence
     of frames with non-decreasing dart counts.
 
-    Handles common collection patterns:
-    - With backgrounds: 0 → 1 → 2 → 3 → 0 → 1 → 2 → 3
-    - Without backgrounds: 1 → 2 → 3 → 1 → 2 → 3 (most common)
+    Rounds that start without a background frame (e.g. 3→1 transitions)
+    get a background injected from the collected background frames, since
+    the board and lighting are largely static.
 
     Returns list of rounds, where each round is a list of
     {"gray": ndarray, "tips": [(x,y),...], "n_darts": int}.
     """
     # Sort by timestamp to get capture order
     sorted_ann = sorted(annotations, key=lambda a: a.get("timestamp", 0))
+
+    # Collect all background frames for injection
+    bg_grays = []
+    for entry in sorted_ann:
+        if entry.get("n_darts", 0) == 0:
+            path = img_dir / entry["filename"]
+            img = cv2.imread(str(path))
+            if img is not None:
+                bg_grays.append(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+
+    # Build a median background if we have multiple
+    bg_inject = None
+    if bg_grays:
+        bg_inject = np.median(np.array(bg_grays), axis=0).astype(np.uint8)
 
     rounds = []
     current_round = []
@@ -241,6 +255,13 @@ def _group_into_rounds(annotations, img_dir):
 
     if current_round:
         rounds.append(current_round)
+
+    # Optionally inject background into rounds that lack one
+    if inject_backgrounds and bg_inject is not None:
+        bg_item = {"gray": bg_inject, "tips": [], "n_darts": 0}
+        for i, rnd in enumerate(rounds):
+            if rnd[0]["n_darts"] > 0:
+                rounds[i] = [bg_item] + rnd
 
     return rounds
 

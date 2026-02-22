@@ -194,6 +194,8 @@ def main():
                         last_score_info = score_info
 
                         print(f">>> DART: {score_info['label']}")
+                        print(f"    cam=({tip[0]},{tip[1]}) → canonical=({score_info['x']:.1f},{score_info['y']:.1f}) "
+                              f"r={score_info['r']:.1f}mm θ={score_info['theta']:.1f}°")
 
                         remaining = None
                         if game:
