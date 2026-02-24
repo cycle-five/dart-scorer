@@ -150,6 +150,15 @@ ILLUMINATION_CHANGE_THRESHOLD = 20.0  # mean pixel intensity units (0–255)
 MOTION_COOLDOWN_FRAMES = 5  # frames
 
 # ---------------------------------------------------------------------------
+# ROI (Region of Interest) cropping
+# ---------------------------------------------------------------------------
+
+# Pixels of padding around the board bounding box when cropping the
+# undistorted frame to just the dartboard region.  Keeps a margin so darts
+# at the outer edge are not clipped.
+ROI_PADDING = 60  # pixels
+
+# ---------------------------------------------------------------------------
 # Game constants
 # ---------------------------------------------------------------------------
 

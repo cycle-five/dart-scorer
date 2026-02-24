@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -260,8 +261,39 @@ def calibrate_lens(cap, debug=False):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Board calibration (manual 5-point click)
+# Phase 2 — Board calibration (manual 21-point click)
 # ---------------------------------------------------------------------------
+
+
+def _compute_canonical_destinations(scale_factor=1.0):
+    """Return 21 (x, y) float tuples for the canonical board coordinate system.
+
+    Point 0: bullseye center at (170, 170).
+    Points 1-20: wire intersections at the outer double ring — where sector
+      boundary wires cross the outer wire.  These are physical features
+      visible on the board, easier to click than sector midpoints.
+      angle = i * 18 - 9 degrees, measured clockwise from 12 o'clock.
+    """
+    cx, cy = config.CANONICAL_CENTER   # (170, 170)
+    r = config.DOUBLE_OUTER_RADIUS     # 170
+    destinations = [(float(cx), float(cy))]  # bullseye center
+    for i in range(20):
+        angle = i * 18.0 - 9.0  # sector boundary, not midpoint
+        x = cx + (r * scale_factor) * math.sin(math.radians(angle))
+        y = cy - (r * scale_factor) * math.cos(math.radians(angle))
+        destinations.append((x, y))
+    return destinations
+
+
+def _make_click_colors(n):
+    """Return n visually distinct BGR color tuples using evenly-spaced HSV hues."""
+    colors = []
+    for i in range(n):
+        hue = int(180 * i / n)  # OpenCV hue range 0-179
+        bgr = cv2.cvtColor(np.uint8([[[hue, 255, 255]]]), cv2.COLOR_HSV2BGR)[0][0]
+        colors.append(tuple(int(c) for c in bgr))
+    return colors
+
 
 # Mouse callback state for point collection
 _click_points = []
@@ -276,20 +308,19 @@ def _mouse_callback(event, x, y, flags, param):
 
 
 def calibrate_board(cap, debug=False):
-    """Phase 2: Manual 5-point board calibration.
+    """Phase 2: Manual 21-point board calibration.
 
-    The user clicks 5 known landmarks on the dartboard to establish both
+    The user clicks 21 known landmarks on the dartboard to establish both
     the board's shape (perspective) and rotational orientation (where 20 is).
 
     Points to click (in order):
     1. Bullseye center
-    2. Top of board — outer double wire at 12 o'clock (sector 20)
-    3. Right of board — outer double wire at 3 o'clock (sector 6)
-    4. Bottom of board — outer double wire at 6 o'clock (sector 3)
-    5. Left of board — outer double wire at 9 o'clock (sector 11)
+    2-21. Wire intersections at the outer double ring — where each sector
+          boundary wire crosses the outer wire, clockwise from the 5/20
+          boundary (just left of 12 o'clock).
 
-    These 5 points map to known canonical positions, giving us a homography
-    that captures both perspective distortion AND board rotation.
+    Wire intersections are physically visible crossings, much easier to
+    click precisely than sector midpoints.
     """
     global _click_points, _click_frame
 
@@ -300,9 +331,9 @@ def calibrate_board(cap, debug=False):
         print(f"ERROR: {e}")
         return False
 
-    print("\n=== Board Calibration (Manual 5-Point) ===")
+    print("\n=== Board Calibration (Manual 21-Point) ===")
     print("Position camera so the full dartboard is visible.")
-    print("Press SPACE to capture a frame, then click 5 points.\n")
+    print("Press SPACE to capture a frame, then click 21 points.\n")
 
     window = "Board Calibration"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
@@ -340,53 +371,42 @@ def calibrate_board(cap, debug=False):
         cv2.destroyWindow(window)
         return False
 
-    # --- Step 2: Collect 5 clicks ---
+    # --- Step 2: Collect 21 clicks ---
     _click_points = []
     _click_frame = captured_frame.copy()
     cv2.setMouseCallback(window, _mouse_callback)
 
-    point_labels = [
-        "1/5: Click the BULLSEYE (center of board)",
-        "2/5: Click 12 o'clock — outer wire at TOP (sector 20)",
-        "3/5: Click 3 o'clock — outer wire at RIGHT (sector 6)",
-        "4/5: Click 6 o'clock — outer wire at BOTTOM (sector 3)",
-        "5/5: Click 9 o'clock — outer wire at LEFT (sector 11)",
-    ]
+    # Build point labels — each outer click is a wire intersection between
+    # two adjacent sectors.  Boundary i (0-based) sits between
+    # SECTOR_ORDER[(i-1) % 20] and SECTOR_ORDER[i].
+    SO = config.SECTOR_ORDER
+    point_labels = ["1/21: Click the BULLSEYE (center of board)"]
+    click_short_labels = ["Bull"]
+    for i in range(20):
+        left_sector = SO[(i - 1) % 20]
+        right_sector = SO[i]
+        hint = ""
+        if i == 0:
+            hint = " (near top, start here)"
+        elif i == 10:
+            hint = " (near bottom)"
+        point_labels.append(
+            f"{i+2}/21: Wire crossing — {left_sector}/{right_sector}{hint}")
+        click_short_labels.append(f"{left_sector}|{right_sector}")
 
-    # Canonical destinations for each click:
-    #   center    → (170, 170)
-    #   top (20)  → (170, 0)     — 12 o'clock on outer ring
-    #   right (6) → (340, 170)   — 3 o'clock
-    #   bottom(3) → (170, 340)   — 6 o'clock
-    #   left (11) → (0, 170)     — 9 o'clock
-    canonical_r = config.DOUBLE_OUTER_RADIUS  # 170
-    cx, cy = config.CANONICAL_CENTER          # (170, 170)
-    dst_positions = [
-        (float(cx), float(cy)),            # center
-        (float(cx), float(cy - canonical_r)),  # top
-        (float(cx + canonical_r), float(cy)),  # right
-        (float(cx), float(cy + canonical_r)),  # bottom
-        (float(cx - canonical_r), float(cy)),  # left
-    ]
+    colors = _make_click_colors(21)
 
-    print("Click 5 points on the board in order:")
-    for lbl in point_labels:
-        print(f"  {lbl}")
+    print("Click 21 points on the board in order:")
+    print(f"  {point_labels[0]}")
+    for i in range(1, 21):
+        print(f"  {point_labels[i]}")
     print("Press 'u' to undo last click, 'q' to abort.\n")
 
-    colors = [
-        (0, 0, 255),    # center: red
-        (0, 255, 255),  # top: yellow
-        (0, 255, 0),    # right: green
-        (255, 0, 0),    # bottom: blue
-        (255, 0, 255),  # left: magenta
-    ]
-
     try:
-        while len(_click_points) < 5:
+        while len(_click_points) < 21:
             display = captured_frame.copy()
 
-            # Draw instruction
+            # Draw instruction for the next point
             idx = len(_click_points)
             cv2.putText(display, point_labels[idx],
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
@@ -394,16 +414,14 @@ def calibrate_board(cap, debug=False):
                         (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
             # Draw already-clicked points with labels
-            click_labels = ["Center", "Top(20)", "Right(6)", "Bottom(3)", "Left(11)"]
             for i, pt in enumerate(_click_points):
-                cv2.circle(display, pt, 8, colors[i], 2)
+                cv2.circle(display, pt, 6, colors[i], 2)
                 cv2.circle(display, pt, 2, colors[i], -1)
-                cv2.putText(display, click_labels[i], (pt[0] + 12, pt[1] - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[i], 1)
+                cv2.putText(display, click_short_labels[i], (pt[0] + 8, pt[1] - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, colors[i], 1)
 
-            # Draw crosshair lines between cardinal points if we have them
+            # Draw spokes from center (click 0) to each subsequent click
             if len(_click_points) >= 2:
-                # Draw line from center to each clicked cardinal point
                 for i in range(1, len(_click_points)):
                     cv2.line(display, _click_points[0], _click_points[i],
                              colors[i], 1, cv2.LINE_AA)
@@ -422,45 +440,19 @@ def calibrate_board(cap, debug=False):
         cv2.destroyWindow(window)
         return False
 
-    print(f"\nCollected {len(_click_points)} points:")
-    click_labels = ["Center", "Top(20)", "Right(6)", "Bottom(3)", "Left(11)"]
+    # --- Step 3: Diagnostics + Compute homography ---
     center_px = _click_points[0]
-    for i, pt in enumerate(_click_points):
-        if i == 0:
-            print(f"  {click_labels[i]}: ({pt[0]}, {pt[1]})")
-        else:
-            # Compute pixel distance from center to this cardinal point
-            dx = pt[0] - center_px[0]
-            dy = pt[1] - center_px[1]
-            px_dist = (dx**2 + dy**2) ** 0.5
-            print(f"  {click_labels[i]}: ({pt[0]}, {pt[1]})  "
-                  f"[{px_dist:.1f}px from center]")
-
-    # Diagnostic: show the canonical mapping parameters
-    print(f"\n--- Calibration diagnostics ---")
-    print(f"  Canonical circle: {config.CANONICAL_DIAMETER}x{config.CANONICAL_DIAMETER}px, "
-          f"center=({cx},{cy})")
-    print(f"  Outer double radius (canonical): {canonical_r}px = {canonical_r}mm")
-    print(f"  Click-derived radii (camera pixels):")
-    for i in range(1, 5):
+    radii = []
+    for i in range(1, 21):
         dx = _click_points[i][0] - center_px[0]
         dy = _click_points[i][1] - center_px[1]
-        print(f"    {click_labels[i]}: {(dx**2 + dy**2)**0.5:.1f}px")
-    avg_radius = np.mean([
-        ((p[0]-center_px[0])**2 + (p[1]-center_px[1])**2)**0.5
-        for p in _click_points[1:]
-    ])
-    print(f"  Average click radius: {avg_radius:.1f}px")
-    print(f"  Implied scale: {avg_radius:.1f}px → {canonical_r}px canonical "
-          f"({canonical_r/avg_radius:.4f} px/px)")
-    print(f"---")
+        radii.append((dx**2 + dy**2)**0.5)
+    print(f"\nCollected 21 points:")
+    print(f"  Bullseye: ({center_px[0]}, {center_px[1]})")
+    print(f"  Outer point radii: min={min(radii):.1f}px, max={max(radii):.1f}px, "
+          f"mean={np.mean(radii):.1f}px")
 
-    # --- Step 3: Compute homography ---
-    # Use only the 5 clicked points. A homography has 8 DOF; 5 points give
-    # 10 constraints, which is a clean slightly-overdetermined least-squares fit.
-    # Do NOT interpolate midpoints — averaging camera-space coords assumes
-    # linear distortion, but perspective distortion is projective, so
-    # interpolated points would be wrong and poison the fit.
+    dst_positions = _compute_canonical_destinations(1.0)
     src_pts = np.array(_click_points, dtype=np.float32)
     dst_pts = np.array(dst_positions, dtype=np.float32)
 
@@ -471,24 +463,22 @@ def calibrate_board(cap, debug=False):
         cv2.destroyWindow(window)
         return False
 
-    # Diagnostic: warp the original 5 click points through H and verify
-    print(f"\n--- Homography verification ---")
-    print(f"  Warping clicked points through H to check mapping accuracy:")
-    orig_5 = np.array(_click_points, dtype=np.float32).reshape(-1, 1, 2)
-    warped_pts = cv2.perspectiveTransform(orig_5, H)
-    expected = dst_positions
-    for i in range(5):
-        wx, wy = warped_pts[i][0]
-        ex, ey = expected[i]
+    print(f"\n--- Homography verification (21 points) ---")
+    orig = np.array(_click_points, dtype=np.float32).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(orig, H)
+    errors = []
+    for i in range(21):
+        wx, wy = warped[i][0]
+        ex, ey = dst_positions[i]
         err = ((wx - ex)**2 + (wy - ey)**2) ** 0.5
-        print(f"    {click_labels[i]}: clicked ({_click_points[i][0]}, {_click_points[i][1]}) "
-              f"→ canonical ({wx:.1f}, {wy:.1f}), "
-              f"expected ({ex:.0f}, {ey:.0f}), error={err:.1f}px")
+        errors.append(err)
+        label = click_short_labels[i]
+        print(f"    {label}: clicked ({_click_points[i][0]}, {_click_points[i][1]}) "
+              f"→ ({wx:.1f}, {wy:.1f}), expected ({ex:.0f}, {ey:.0f}), err={err:.1f}px")
+    print(f"  Mean error: {np.mean(errors):.2f}px, max: {np.max(errors):.2f}px")
     print(f"---")
 
-    # --- Interactive scale adjustment + verification ---
-    # Let the user press [ / ] to shrink/grow the mapping and visually align
-    # the overlay rings with the actual board bands.
+    # --- Step 4: Interactive scale adjustment ---
     scale_factor = 1.0
     scale_step = 0.005  # 0.5% per keypress
 
@@ -496,12 +486,12 @@ def calibrate_board(cap, debug=False):
     canon_win = "Canonical View — [ ] to scale, ENTER to accept, q to abort"
     cv2.namedWindow(canon_win, cv2.WINDOW_NORMAL)
 
-    # Draw the clicked points on the original frame
+    # Draw the clicked points on the original frame for the debug view
     debug_frame = captured_frame.copy()
     for i, pt in enumerate(_click_points):
-        cv2.circle(debug_frame, pt, 8, colors[min(i, len(colors)-1)], 2)
-        cv2.circle(debug_frame, pt, 2, colors[min(i, len(colors)-1)], -1)
-    for i in range(1, 5):
+        cv2.circle(debug_frame, pt, 6, colors[i], 2)
+        cv2.circle(debug_frame, pt, 2, colors[i], -1)
+    for i in range(1, 21):
         cv2.line(debug_frame, _click_points[0], _click_points[i],
                  colors[i], 1, cv2.LINE_AA)
     cv2.imshow(window, debug_frame)
@@ -514,31 +504,17 @@ def calibrate_board(cap, debug=False):
     print("  q = abort and redo\n")
 
     while True:
-        # Recompute homography with current scale
-        # Scaling works by adjusting the canonical destination radius
-        scaled_r = canonical_r * scale_factor
-        scaled_cx, scaled_cy = cx, cy
-
-        # Rebuild destination points with scaled radius (5 points only)
-        scaled_dst = np.array([
-            [float(scaled_cx), float(scaled_cy)],
-            [float(scaled_cx), float(scaled_cy - scaled_r)],
-            [float(scaled_cx + scaled_r), float(scaled_cy)],
-            [float(scaled_cx), float(scaled_cy + scaled_r)],
-            [float(scaled_cx - scaled_r), float(scaled_cy)],
-        ], dtype=np.float32)
-
+        scaled_dst = np.array(_compute_canonical_destinations(scale_factor), dtype=np.float32)
         H_scaled, _ = cv2.findHomography(src_pts, scaled_dst, 0)
 
         if H_scaled is None:
             print("ERROR: Homography failed at this scale.")
             break
 
-        warped = cv2.warpPerspective(captured_frame, H_scaled,
-                                      (canonical_size, canonical_size))
-        warped_overlay = board.draw_board_overlay(warped, alpha=0.4)
+        warped_frame = cv2.warpPerspective(captured_frame, H_scaled,
+                                           (canonical_size, canonical_size))
+        warped_overlay = board.draw_board_overlay(warped_frame, alpha=0.4)
 
-        # Show scale info on the overlay
         scale_text = f"Scale: {scale_factor:.3f}  [ ] to adjust, ENTER to accept"
         cv2.putText(warped_overlay, scale_text, (5, canonical_size - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
@@ -569,14 +545,31 @@ def calibrate_board(cap, debug=False):
     if scale_factor != 1.0:
         print(f"Applied scale adjustment: {scale_factor:.3f}")
 
-    # --- Save ---
+    # --- Step 5: ROI computation + save ---
+    all_clicks = np.array(_click_points)
+    x_min = int(np.min(all_clicks[:, 0])) - config.ROI_PADDING
+    y_min = int(np.min(all_clicks[:, 1])) - config.ROI_PADDING
+    x_max = int(np.max(all_clicks[:, 0])) + config.ROI_PADDING
+    y_max = int(np.max(all_clicks[:, 1])) + config.ROI_PADDING
+
+    # Clamp to frame bounds
+    h_frame, w_frame = captured_frame.shape[:2]
+    x_min = max(0, x_min)
+    y_min = max(0, y_min)
+    x_max = min(w_frame, x_max)
+    y_max = min(h_frame, y_max)
+
+    board_roi = np.array([x_min, y_min, x_max, y_max], dtype=np.int32)
+    print(f"Board ROI: ({x_min}, {y_min}) to ({x_max}, {y_max}) = {x_max-x_min}x{y_max-y_min}px")
+
     save_path = config.BOARD_HOMOGRAPHY_PATH
     save_path.parent.mkdir(parents=True, exist_ok=True)
     center_pt = _click_points[0]
     np.savez(str(save_path), homography=H,
              ellipse_center=np.array(center_pt, dtype=np.float64),
              click_points=np.array(_click_points, dtype=np.float64),
-             scale_factor=scale_factor)
+             scale_factor=scale_factor,
+             board_roi=board_roi)
     print(f"Board homography saved to: {save_path}")
 
     print("Board calibration complete.\n")

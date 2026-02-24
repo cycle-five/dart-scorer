@@ -139,13 +139,21 @@ def main():
     hom_data = np.load(str(homography_path))
     homography = hom_data['homography']
     ellipse_center = tuple(hom_data['ellipse_center'])
+    board_roi = tuple(hom_data['board_roi'].astype(int)) if 'board_roi' in hom_data else None
+
+    if board_roi is not None:
+        roi_x0, roi_y0, roi_x1, roi_y1 = board_roi
+        detector_center = (int(ellipse_center[0]) - roi_x0, int(ellipse_center[1]) - roi_y0)
+        print(f"Board ROI: ({roi_x0},{roi_y0}) to ({roi_x1},{roi_y1}) = {roi_x1-roi_x0}x{roi_y1-roi_y0}px")
+    else:
+        detector_center = (int(ellipse_center[0]), int(ellipse_center[1]))
+        print("No board ROI found — using full frame")
 
     print("Calibration loaded successfully.")
 
     # --- Setup ---
     cap = open_camera()
-    detector = DartDetector(board_center=(int(ellipse_center[0]), int(ellipse_center[1])),
-                           debug=args.debug)
+    detector = DartDetector(board_center=detector_center, debug=args.debug)
     init_csv_log()
 
     game = None
@@ -179,17 +187,25 @@ def main():
             undistorted = undistort_frame(frame, cam_mtx, dist_coeffs, new_cam_mtx, roi)
             display = undistorted.copy()
 
-            gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
+            # Crop to board ROI for detection (smaller frame = fewer false positives)
+            if board_roi is not None:
+                roi_x0, roi_y0, roi_x1, roi_y1 = board_roi
+                detect_frame = undistorted[roi_y0:roi_y1, roi_x0:roi_x1]
+            else:
+                detect_frame = undistorted
 
             if state == State.WAITING:
                 # Look for new darts
-                detections = detector.process_frame(undistorted)
+                detections = detector.process_frame(detect_frame)
 
                 if detections:
                     state = State.DART_DETECTED
                     for det in detections:
                         tip = det['tip']
-                        # Score the dart
+                        # Offset tip back to full-frame coordinates for scoring
+                        if board_roi is not None:
+                            tip = (tip[0] + roi_x0, tip[1] + roi_y0)
+                        # Score the dart (uses full-frame coords)
                         score_info = board.score_from_camera(tip, homography)
                         last_score_info = score_info
 
@@ -210,17 +226,21 @@ def main():
                         log_detection(score_info, tip, game_mode,
                                      game.remaining if game else None)
 
-                    # Absorb current scene so next detection only sees NEW darts
-                    detector.absorb_current_scene(gray)
+                    # Absorb current scene (use cropped frame)
+                    gray_detect = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
+                    detector.absorb_current_scene(gray_detect)
                     state = State.WAITING_FOR_REMOVAL
 
             elif state == State.WAITING_FOR_REMOVAL:
                 # Still run detection to catch additional darts
-                detections = detector.process_frame(undistorted)
+                detections = detector.process_frame(detect_frame)
 
                 if detections:
                     for det in detections:
                         tip = det['tip']
+                        # Offset tip back to full-frame coordinates
+                        if board_roi is not None:
+                            tip = (tip[0] + roi_x0, tip[1] + roi_y0)
                         score_info = board.score_from_camera(tip, homography)
                         last_score_info = score_info
 
@@ -238,11 +258,13 @@ def main():
                         log_detection(score_info, tip, game_mode,
                                      game.remaining if game else None)
 
-                    # Absorb again after new darts detected
-                    detector.absorb_current_scene(gray)
+                    # Absorb again after new darts detected (use cropped frame)
+                    gray_detect = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
+                    detector.absorb_current_scene(gray_detect)
 
-                # Check if all darts removed
-                removed = detector.dart_removed(gray)
+                # Check if all darts removed (use cropped frame)
+                gray_detect = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
+                removed = detector.dart_removed(gray_detect)
                 if removed and len(detector.confirmed_darts) == 0:
                     print("  (Darts removed — ready for next throw)\n")
                     state = State.WAITING
@@ -274,12 +296,19 @@ def main():
             # Draw confirmed dart tips
             for blob_id, dart in detector.confirmed_darts.items():
                 tx, ty = dart['tip']
+                # Offset from cropped to full-frame coords for display
+                if board_roi is not None:
+                    tx, ty = tx + roi_x0, ty + roi_y0
                 cv2.circle(display, (tx, ty), 8, (0, 0, 255), 2)
                 cv2.circle(display, (tx, ty), 2, (0, 0, 255), -1)
 
-            # Debug overlay
+            # Debug overlay — build on cropped frame, blit back onto display
             if args.debug:
-                display = detector.get_debug_frame(display, [])
+                debug_cropped = detector.get_debug_frame(detect_frame, [])
+                if board_roi is not None:
+                    display[roi_y0:roi_y1, roi_x0:roi_x1] = debug_cropped
+                else:
+                    display = debug_cropped
 
             cv2.imshow(window, display)
 
@@ -303,7 +332,13 @@ def main():
                     hom_data = np.load(str(homography_path))
                     homography = hom_data['homography']
                     ellipse_center = tuple(hom_data['ellipse_center'])
-                    detector.board_center = (int(ellipse_center[0]), int(ellipse_center[1]))
+                    board_roi = tuple(hom_data['board_roi'].astype(int)) if 'board_roi' in hom_data else None
+                    if board_roi is not None:
+                        roi_x0, roi_y0, roi_x1, roi_y1 = board_roi
+                        detector_center = (int(ellipse_center[0]) - roi_x0, int(ellipse_center[1]) - roi_y0)
+                    else:
+                        detector_center = (int(ellipse_center[0]), int(ellipse_center[1]))
+                    detector.board_center = detector_center
                     detector.reset()
                     state = State.WAITING
                     last_score_info = None
