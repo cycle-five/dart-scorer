@@ -169,8 +169,10 @@ class VideoTrigger:
 class AnnotationSession:
     """Encapsulates annotation state for a single frozen frame."""
 
-    def __init__(self, homography=None, previous_annotations=None, start_ordinal=1):
+    def __init__(self, homography=None, previous_annotations=None, start_ordinal=1,
+                 crop_offset=(0, 0)):
         self.homography = homography
+        self.crop_offset = crop_offset
         self.annotations = list(previous_annotations or [])
         self.dart_ordinal = start_ordinal
         self.click_point = None
@@ -188,7 +190,7 @@ class AnnotationSession:
     def handle_click(self, x, y):
         """Process a mouse click on the image."""
         self.click_point = (x, y)
-        guess = _guess_segment_from_homography(x, y, self.homography)
+        guess = _guess_segment_from_homography(x, y, self.homography, self.crop_offset)
         if guess:
             self.guess_segment = guess
             self.text_input = guess.lower()
@@ -259,12 +261,21 @@ class AnnotationSession:
 # Rendering helpers
 # ---------------------------------------------------------------------------
 
-def _guess_segment_from_homography(x, y, homography):
-    """Use board homography to guess which segment a click is in."""
+def _guess_segment_from_homography(x, y, homography, crop_offset=(0, 0)):
+    """Use board homography to guess which segment a click is in.
+
+    Args:
+        x, y: Click coordinates in the (possibly cropped) image.
+        homography: 3x3 homography matrix (computed on full-frame coords).
+        crop_offset: (x_offset, y_offset) to map cropped coords back to full frame.
+    """
     if homography is None:
         return None
     try:
-        score_info = board.score_from_camera((x, y), homography)
+        # Map cropped coords back to full-frame coords for homography
+        full_x = x + crop_offset[0]
+        full_y = y + crop_offset[1]
+        score_info = board.score_from_camera((full_x, full_y), homography)
         ring = score_info["ring"]
         sector = score_info["sector"]
         if ring == "D-BULL":
@@ -540,8 +551,10 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
         print("WARNING: No lens params found, running without undistortion")
 
     crop_roi = load_crop_roi()
+    crop_offset = (0, 0)
     if crop_roi is not None:
         x, y, w, h = crop_roi
+        crop_offset = (x, y)
         print(f"Crop ROI: ({x}, {y}) {w}x{h}")
     else:
         print("No crop ROI — using full frame")
@@ -661,6 +674,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                         homography=homography,
                         previous_annotations=previous_annotations,
                         start_ordinal=dart_ordinal,
+                        crop_offset=crop_offset,
                     )
                     session._init_carry_count(len(previous_annotations))
                     _session_ref[0] = session
@@ -718,6 +732,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     homography=homography,
                     previous_annotations=previous_annotations,
                     start_ordinal=dart_ordinal,
+                    crop_offset=crop_offset,
                 )
                 session._init_carry_count(len(previous_annotations))
                 _session_ref[0] = session
