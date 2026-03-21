@@ -1,5 +1,5 @@
 __pycache__/
 *.png
-data/training/images/
-data/training/labels/
+data/
+.omc/
 
