@@ -10,6 +10,9 @@ Audio trigger: listens to the camera mic for the "thud" of a dart hitting
 the board and auto-freezes the frame for annotation. Falls back to manual
 SPACE capture if --no-audio is set or the mic isn't available.
 
+Board homography (if calibrated) provides a segment guess when you click a
+tip, so you can just press ENTER to accept or type a correction.
+
 Usage:
     python collect.py                          # Start collecting (audio trigger on)
     python collect.py --no-audio               # Manual SPACE capture only
@@ -19,10 +22,10 @@ Usage:
 Controls:
     (auto)  Frame freezes on dart impact sound
     SPACE   Manual capture/freeze (always available)
-    Click   Mark a dart tip (while frozen)
-    Then type segment shorthand (e.g. t20, s5, dbull) + ENTER to confirm
-    BACKSPACE / Z   Undo last annotation
-    ENTER   Save annotated frame (when no text input active)
+    Click   Mark a dart tip (while frozen) — auto-guesses segment if calibrated
+    ENTER   Accept guess (or type correction first, then ENTER)
+    BACKSPACE / Z   Undo last annotation (when not typing)
+    ENTER   Save annotated frame (when no pending click)
     ESC     Discard current capture and resume live feed
     R       Reset round (back to dart 1)
     +/-     Adjust audio threshold up/down
@@ -42,6 +45,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 import cv2
 import numpy as np
 import config
+import board
 from classes import (
     CLASS_TO_ID, SEGMENTS, make_class_name, segment_shorthand,
     parse_class_name,
@@ -72,8 +76,11 @@ class AudioTrigger:
         self._last_trigger_time = 0.0
         self._stream = None
         self._current_rms = 0.0
+        self._peak_rms = 0.0  # highest RMS seen recently
         self._baseline_rms = 0.01  # running baseline noise level
         self._device = device
+        self._rms_history = []  # rolling history for waveform display
+        self._history_max = 200  # number of samples to keep
 
     def _find_emeet_device(self):
         """Auto-detect the eMeet C950 mic device index."""
@@ -107,6 +114,17 @@ class AudioTrigger:
         def callback(indata, frames, time_info, status):
             rms = float(np.sqrt(np.mean(indata ** 2)))
             self._current_rms = rms
+
+            # Track peak (decays slowly)
+            if rms > self._peak_rms:
+                self._peak_rms = rms
+            else:
+                self._peak_rms = max(rms, self._peak_rms * 0.995)
+
+            # Rolling history for waveform
+            self._rms_history.append(rms)
+            if len(self._rms_history) > self._history_max:
+                self._rms_history.pop(0)
 
             # Update baseline with slow-moving average (ignore spikes)
             if rms < self._baseline_rms * 3:
@@ -159,14 +177,49 @@ class AudioTrigger:
 _click_point = None  # pending click waiting for label
 _annotations = []    # list of (x, y, class_name) for current frame
 _text_input = ""     # current text being typed for segment label
+_guess_segment = ""  # homography-based segment guess (pre-filled on click)
 _active = False      # whether we're in annotation mode
 _dart_ordinal = 1    # current dart number in round (1, 2, or 3)
 
 
+def _guess_segment_from_homography(x, y, homography):
+    """Use board homography to guess which segment a click is in.
+
+    Returns a segment shorthand string (e.g. "T20", "S5", "D_BULL") or None.
+    """
+    if homography is None:
+        return None
+    try:
+        score_info = board.score_from_camera((x, y), homography)
+        ring = score_info["ring"]
+        sector = score_info["sector"]
+
+        if ring == "D-BULL":
+            return "D_BULL"
+        elif ring == "S-BULL":
+            return "S_BULL"
+        elif ring == "miss":
+            return None
+        else:
+            ring_code = {"single": "S", "double": "D", "triple": "T"}[ring]
+            return f"{ring_code}{sector}"
+    except Exception:
+        return None
+
+
 def _mouse_callback(event, x, y, flags, param):
-    global _click_point
+    global _click_point, _text_input, _guess_segment
     if _active and event == cv2.EVENT_LBUTTONDOWN:
         _click_point = (x, y)
+        # Auto-guess segment from homography
+        homography = param  # passed via cv2.setMouseCallback(..., param=homography)
+        guess = _guess_segment_from_homography(x, y, homography)
+        if guess:
+            _guess_segment = guess
+            _text_input = guess.lower()
+        else:
+            _guess_segment = ""
+            _text_input = ""
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +228,7 @@ def _mouse_callback(event, x, y, flags, param):
 
 def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                  use_audio=True, audio_device=None, audio_threshold=0.15):
-    global _click_point, _annotations, _text_input, _active, _dart_ordinal
+    global _click_point, _annotations, _text_input, _guess_segment, _active, _dart_ordinal
 
     outdir = Path(outdir)
     img_dir = outdir / "images"
@@ -203,6 +256,15 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
     elif use_undistort:
         print("WARNING: No lens params found, running without undistortion")
 
+    # Load board homography for segment guessing (optional)
+    homography = None
+    if config.BOARD_HOMOGRAPHY_PATH.exists():
+        hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH))
+        homography = hom_data['homography']
+        print("Board homography loaded — segment guess enabled")
+    else:
+        print("No board homography — you'll type segments manually")
+
     # Audio trigger setup
     audio = None
     if use_audio:
@@ -212,7 +274,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
 
     win = "Collect Training Data"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(win, _mouse_callback)
+    cv2.setMouseCallback(win, _mouse_callback, param=homography)
 
     print("\n=== YOLO Training Data Collection (186 classes) ===")
     print(f"Output: {outdir.resolve()}")
@@ -263,16 +325,59 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                 display = frame.copy()
                 h, w = display.shape[:2]
 
-                # Audio level meter
+                # Audio debug panel — scrolling waveform + meters
                 if audio:
                     rms = audio.current_rms
-                    meter_w = int(min(rms / 0.5, 1.0) * 200)
-                    meter_color = (0, 0, 255) if rms > audio.threshold else (0, 255, 0)
-                    cv2.rectangle(display, (w - 220, 10), (w - 220 + meter_w, 25), meter_color, -1)
-                    cv2.rectangle(display, (w - 220, 10), (w - 20, 25), (100, 100, 100), 1)
-                    # Threshold marker
-                    thresh_x = w - 220 + int(min(audio.threshold / 0.5, 1.0) * 200)
-                    cv2.line(display, (thresh_x, 8), (thresh_x, 27), (0, 255, 255), 2)
+                    peak = audio._peak_rms
+                    baseline = audio._baseline_rms
+                    history = audio._rms_history
+
+                    # Panel dimensions
+                    panel_w, panel_h = 300, 100
+                    panel_x = w - panel_w - 10
+                    panel_y = 10
+
+                    # Semi-transparent background
+                    overlay = display.copy()
+                    cv2.rectangle(overlay, (panel_x, panel_y),
+                                  (panel_x + panel_w, panel_y + panel_h),
+                                  (0, 0, 0), -1)
+                    cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
+
+                    # Auto-scale: use max of (threshold*2, peak) so the view adapts
+                    y_scale = max(audio.threshold * 2, peak * 1.2, 0.05)
+
+                    # Draw threshold line (yellow)
+                    thresh_y = panel_y + panel_h - int((audio.threshold / y_scale) * (panel_h - 20))
+                    thresh_y = max(panel_y + 12, min(panel_y + panel_h - 2, thresh_y))
+                    cv2.line(display, (panel_x, thresh_y), (panel_x + panel_w, thresh_y),
+                             (0, 255, 255), 1)
+                    cv2.putText(display, f"thresh={audio.threshold:.3f}",
+                                (panel_x + 2, thresh_y - 3),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 255), 1)
+
+                    # Draw baseline line (dim gray)
+                    base_y = panel_y + panel_h - int((baseline / y_scale) * (panel_h - 20))
+                    base_y = max(panel_y + 12, min(panel_y + panel_h - 2, base_y))
+                    cv2.line(display, (panel_x, base_y), (panel_x + panel_w, base_y),
+                             (80, 80, 80), 1)
+
+                    # Draw scrolling waveform
+                    if len(history) > 1:
+                        for i in range(1, len(history)):
+                            x1 = panel_x + int((i - 1) / audio._history_max * panel_w)
+                            x2 = panel_x + int(i / audio._history_max * panel_w)
+                            y1 = panel_y + panel_h - int((history[i-1] / y_scale) * (panel_h - 20))
+                            y2 = panel_y + panel_h - int((history[i] / y_scale) * (panel_h - 20))
+                            y1 = max(panel_y + 2, min(panel_y + panel_h - 2, y1))
+                            y2 = max(panel_y + 2, min(panel_y + panel_h - 2, y2))
+                            color = (0, 0, 255) if history[i] > audio.threshold else (0, 200, 0)
+                            cv2.line(display, (x1, y1), (x2, y2), color, 1)
+
+                    # Current/peak RMS text
+                    cv2.putText(display, f"RMS={rms:.4f}  peak={peak:.4f}  base={baseline:.4f}",
+                                (panel_x + 2, panel_y + panel_h + 14),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
 
                 cv2.putText(display, f"LIVE  |  Saved: {frame_counter}  |  Dart: {_dart_ordinal}/3",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
@@ -305,6 +410,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     _annotations = []
                     _click_point = None
                     _text_input = ""
+                    _guess_segment = ""
                     _active = True
                     trigger_src = "AUDIO" if audio_fired else "MANUAL"
                     print(f"\n[{trigger_src}] Frame captured — annotating dart {_dart_ordinal}")
@@ -327,14 +433,20 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     cv2.putText(display, label, (ax + half + 4, ay + 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                # Draw pending click point
+                # Draw pending click point with guess
                 if _click_point is not None:
                     px, py = _click_point
                     cv2.circle(display, (px, py), 7, (255, 0, 255), 2)
                     cv2.circle(display, (px, py), 2, (255, 0, 255), -1)
-                    input_text = f"Dart {_dart_ordinal} > {_text_input}_"
-                    cv2.putText(display, input_text, (px + 12, py + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                    if _guess_segment and _text_input == _guess_segment.lower():
+                        # Showing the auto-guess — highlight it
+                        input_text = f"Dart {_dart_ordinal} > [{_guess_segment}]  ENTER=accept / type to correct"
+                        cv2.putText(display, input_text, (px + 12, py + 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                    else:
+                        input_text = f"Dart {_dart_ordinal} > {_text_input}_"
+                        cv2.putText(display, input_text, (px + 12, py + 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
                 n = len(_annotations)
                 status = f"FROZEN  |  Dart: {_dart_ordinal}/3  |  Annotated: {n}"
@@ -342,8 +454,12 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
                 if _click_point is not None:
-                    cv2.putText(display, f"Type segment (e.g. t20, s5, dbull) then ENTER",
-                                (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 1)
+                    if _guess_segment and _text_input == _guess_segment.lower():
+                        cv2.putText(display, f"ENTER=accept [{_guess_segment}]  or type correction  ESC=cancel click",
+                                    (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+                    else:
+                        cv2.putText(display, f"Type segment (e.g. t20, s5, dbull) then ENTER  ESC=cancel",
+                                    (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 1)
                 else:
                     cv2.putText(display, "Click=mark tip  ENTER=save  ESC=discard  Z=undo",
                                 (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
@@ -371,6 +487,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                                 print(f"  Annotated: d{_dart_ordinal} {seg} at ({px}, {py}) — {info['label']}")
                                 _click_point = None
                                 _text_input = ""
+                                _guess_segment = ""
 
                                 # Auto-advance ordinal
                                 if _dart_ordinal < 3:
@@ -379,11 +496,17 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     elif key == 27:  # ESC — cancel this click
                         _click_point = None
                         _text_input = ""
+                        _guess_segment = ""
                         print("  Click cancelled")
                     elif key == 8:  # BACKSPACE
                         if _text_input:
                             _text_input = _text_input[:-1]
+                            _guess_segment = ""  # user is editing, clear guess state
                     elif 32 <= key < 127:  # printable character
+                        # If guess is showing and user starts typing, replace it
+                        if _guess_segment and _text_input == _guess_segment.lower():
+                            _text_input = ""
+                            _guess_segment = ""
                         _text_input += chr(key)
                 else:
                     # Not typing — handle frame-level keys
@@ -433,6 +556,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                         _annotations = []
                         _click_point = None
                         _text_input = ""
+                        _guess_segment = ""
 
                     elif key in (ord('z'),) and _annotations:
                         removed = _annotations.pop()
@@ -445,6 +569,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                         _annotations = []
                         _click_point = None
                         _text_input = ""
+                        _guess_segment = ""
                         print("  Round reset — dart 1")
 
     finally:
