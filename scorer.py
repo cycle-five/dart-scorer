@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-scorer.py — Main dart scoring loop.
+scorer.py — Main dart scoring loop using YOLO detection.
 
-Loads calibration data, runs the dart detector, scores detected darts,
-and optionally tracks a game (301 or 501).
+Runs YOLO inference on camera frames to detect darts, classify their
+board segment, and optionally track a game (301 or 501).
 
 Usage:
     python scorer.py                    # Raw detection mode
     python scorer.py --game 501         # Track a 501 game
     python scorer.py --game 301         # Track a 301 game
-    python scorer.py --debug            # Show intermediate CV steps
+    python scorer.py --debug            # Show detection details
+    python scorer.py --conf 0.3         # Custom confidence threshold
 """
 
 import argparse
@@ -20,21 +21,17 @@ import time
 from datetime import datetime
 from enum import Enum, auto
 
-# Suppress Qt/Wayland warnings from pip-installed OpenCV on Linux
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import cv2
 import numpy as np
 import config
-import board
-from calibrate import open_camera, load_lens_params, undistort_frame, calibrate_board
-from detector import DartDetector
+from yolo_detector import YOLODartDetector
 
 
 class State(Enum):
     WAITING = auto()             # No new darts, waiting for throw
-    DART_DETECTED = auto()       # New dart detected, scoring it
-    WAITING_FOR_REMOVAL = auto() # Dart scored, waiting for player to remove darts
+    WAITING_FOR_REMOVAL = auto() # Dart(s) on board, waiting for player to remove
 
 
 def init_csv_log():
@@ -44,28 +41,24 @@ def init_csv_log():
     if not log_path.exists():
         with open(log_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['timestamp', 'cam_x', 'cam_y', 'canonical_x', 'canonical_y',
+            writer.writerow(['timestamp', 'tip_x', 'tip_y',
+                           'class_name', 'confidence',
                            'sector', 'ring', 'multiplier', 'score', 'label',
-                           'game_mode', 'remaining'])
+                           'ordinal', 'game_mode', 'remaining'])
 
-def log_detection(score_info, cam_tip, game_mode=None, remaining=None):
-    """Append a detection to the CSV log.
 
-    Args:
-        score_info: Score dict from board.score_from_camera (canonical coords).
-        cam_tip: (x, y) dart tip in camera pixel space.
-        game_mode: Game variant (301/501) or None.
-        remaining: Remaining score or None.
-    """
+def log_detection(det, game_mode=None, remaining=None):
+    """Append a detection to the CSV log."""
+    info = det["score_info"]
     with open(config.LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
             datetime.now().isoformat(),
-            cam_tip[0], cam_tip[1],
-            score_info['x'], score_info['y'],
-            score_info['sector'], score_info['ring'],
-            score_info['multiplier'], score_info['score'],
-            score_info['label'],
+            det["tip"][0], det["tip"][1],
+            det["class_name"], f"{det['confidence']:.3f}",
+            info["sector"], info["ring"],
+            info["multiplier"], info["score"], info["label"],
+            info["ordinal"],
             game_mode or '',
             remaining if remaining is not None else '',
         ])
@@ -78,27 +71,19 @@ class GameTracker:
         self.starting_score = starting_score
         self.remaining = starting_score
         self.darts_thrown = 0
-        self.round_scores = []  # scores in current round (max 3 per round)
-        self.history = []       # list of all scored darts
+        self.history = []
 
     def add_score(self, points):
-        """Add a dart score. Returns (remaining, bust) tuple.
-
-        In standard rules, if the score would go below 0 or to exactly 1,
-        it's a bust and the round is void. For simplicity, we just prevent
-        going below 0.
-        """
+        """Add a dart score. Returns (remaining, bust)."""
         self.darts_thrown += 1
         self.history.append(points)
 
         new_remaining = self.remaining - points
         if new_remaining < 0:
-            # Bust — score doesn't count
-            print(f"  BUST! {self.remaining} - {points} = {new_remaining} (below zero)")
+            print(f"  BUST! {self.remaining} - {points} = {new_remaining}")
             return self.remaining, True
 
         self.remaining = new_remaining
-        self.round_scores.append(points)
         return self.remaining, False
 
     def is_finished(self):
@@ -107,7 +92,6 @@ class GameTracker:
     def reset(self):
         self.remaining = self.starting_score
         self.darts_thrown = 0
-        self.round_scores = []
         self.history = []
 
     def get_display_text(self):
@@ -115,45 +99,39 @@ class GameTracker:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Dart scoring system")
+    parser = argparse.ArgumentParser(description="YOLO dart scoring system")
     parser.add_argument("--game", type=int, choices=config.SUPPORTED_GAMES,
                        help="Game mode (301 or 501)")
     parser.add_argument("--debug", action="store_true",
-                       help="Show intermediate CV steps")
+                       help="Show detection details")
+    parser.add_argument("--conf", type=float, default=0.25,
+                       help="YOLO confidence threshold (default: 0.25)")
+    parser.add_argument("--weights", type=str, default=None,
+                       help="Path to YOLO weights file")
     args = parser.parse_args()
 
-    # --- Load calibration ---
+    # --- Load YOLO model ---
     try:
-        cam_mtx, dist_coeffs, new_cam_mtx, roi = load_lens_params()
+        detector = YOLODartDetector(
+            weights=args.weights,
+            conf=args.conf,
+        )
     except FileNotFoundError as e:
         print(f"ERROR: {e}")
-        print("Run 'python calibrate.py --lens' first.")
         sys.exit(1)
 
-    homography_path = config.BOARD_HOMOGRAPHY_PATH
-    if not homography_path.exists():
-        print(f"ERROR: Board homography not found at {homography_path}")
-        print("Run 'python calibrate.py --board' first.")
-        sys.exit(1)
+    print("YOLO model loaded.")
 
-    hom_data = np.load(str(homography_path))
-    homography = hom_data['homography']
-    ellipse_center = tuple(hom_data['ellipse_center'])
-    board_roi = tuple(hom_data['board_roi'].astype(int)) if 'board_roi' in hom_data else None
-
-    if board_roi is not None:
-        roi_x0, roi_y0, roi_x1, roi_y1 = board_roi
-        detector_center = (int(ellipse_center[0]) - roi_x0, int(ellipse_center[1]) - roi_y0)
-        print(f"Board ROI: ({roi_x0},{roi_y0}) to ({roi_x1},{roi_y1}) = {roi_x1-roi_x0}x{roi_y1-roi_y0}px")
-    else:
-        detector_center = (int(ellipse_center[0]), int(ellipse_center[1]))
-        print("No board ROI found — using full frame")
-
-    print("Calibration loaded successfully.")
+    # --- Optional lens undistortion ---
+    lens_params = None
+    if config.LENS_PARAMS_PATH.exists():
+        from calibrate import load_lens_params, undistort_frame
+        lens_params = load_lens_params()
+        print("Lens undistortion enabled")
 
     # --- Setup ---
+    from calibrate import open_camera
     cap = open_camera()
-    detector = DartDetector(board_center=detector_center, debug=args.debug)
     init_csv_log()
 
     game = None
@@ -164,15 +142,17 @@ def main():
         print(f"Remaining: {game.remaining}\n")
 
     state = State.WAITING
-    last_score_info = None
+    last_score_label = None
+    # Track how many consecutive frames we see zero darts (for removal detection)
+    empty_frames = 0
+    REMOVAL_THRESHOLD = 10  # frames with 0 detections to confirm darts pulled
 
-    window = "Dart Scorer"
+    window = "Dart Scorer (YOLO)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
 
     print("\nScoring active. Controls:")
     print("  q = quit")
     print("  r = reset game")
-    print("  c = recalibrate board")
     print("  d = toggle debug")
     print()
 
@@ -183,136 +163,96 @@ def main():
                 print("ERROR: Failed to read frame.")
                 break
 
-            # Undistort
-            undistorted = undistort_frame(frame, cam_mtx, dist_coeffs, new_cam_mtx, roi)
-            display = undistorted.copy()
+            # Optional undistortion
+            if lens_params is not None:
+                frame = undistort_frame(frame, *lens_params)
 
-            # Crop to board ROI for detection (smaller frame = fewer false positives)
-            if board_roi is not None:
-                roi_x0, roi_y0, roi_x1, roi_y1 = board_roi
-                detect_frame = undistorted[roi_y0:roi_y1, roi_x0:roi_x1]
-            else:
-                detect_frame = undistorted
+            display = frame.copy()
+
+            # Run YOLO
+            detections = detector.process_frame(frame)
 
             if state == State.WAITING:
-                # Look for new darts
-                detections = detector.process_frame(detect_frame)
+                new_darts = detector.get_new_darts(detections)
 
-                if detections:
-                    state = State.DART_DETECTED
-                    for det in detections:
-                        tip = det['tip']
-                        # Offset tip back to full-frame coordinates for scoring
-                        if board_roi is not None:
-                            tip = (tip[0] + roi_x0, tip[1] + roi_y0)
-                        # Score the dart (uses full-frame coords)
-                        score_info = board.score_from_camera(tip, homography)
-                        last_score_info = score_info
+                for det in new_darts:
+                    detector.confirm_dart(det)
+                    info = det["score_info"]
+                    last_score_label = f"d{info['ordinal']} {info['label']}"
 
-                        print(f">>> DART: {score_info['label']}")
-                        print(f"    cam=({tip[0]},{tip[1]}) → canonical=({score_info['x']:.1f},{score_info['y']:.1f}) "
-                              f"r={score_info['r']:.1f}mm θ={score_info['theta']:.1f}°")
+                    print(f">>> DART {info['ordinal']}: {info['label']} "
+                          f"(conf={det['confidence']:.2f})")
 
-                        remaining = None
-                        if game:
-                            remaining, bust = game.add_score(score_info['score'])
-                            if bust:
-                                print(f"    (Bust — score voided)")
-                            else:
-                                print(f"    {game.get_display_text()}")
-                            if game.is_finished():
-                                print(f"\n*** GAME OVER! {game_mode} completed in {game.darts_thrown} darts! ***\n")
+                    if game:
+                        remaining, bust = game.add_score(info["score"])
+                        if bust:
+                            print(f"    (Bust)")
+                        else:
+                            print(f"    {game.get_display_text()}")
+                        if game.is_finished():
+                            print(f"\n*** GAME OVER! {game_mode} in {game.darts_thrown} darts! ***\n")
 
-                        log_detection(score_info, tip, game_mode,
-                                     game.remaining if game else None)
+                    log_detection(det, game_mode,
+                                 game.remaining if game else None)
 
-                    # Absorb current scene (use cropped frame)
-                    gray_detect = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
-                    detector.absorb_current_scene(gray_detect)
+                if detector.round_dart_count >= 3:
                     state = State.WAITING_FOR_REMOVAL
+                    empty_frames = 0
+                elif detector.round_dart_count > 0 and len(detections) == 0:
+                    # Darts may have been pulled mid-round
+                    empty_frames += 1
+                    if empty_frames >= REMOVAL_THRESHOLD:
+                        print("  (Darts removed — new round)\n")
+                        detector.reset()
+                        state = State.WAITING
+                        last_score_label = None
+                        empty_frames = 0
+                else:
+                    empty_frames = 0
 
             elif state == State.WAITING_FOR_REMOVAL:
-                # Still run detection to catch additional darts
-                detections = detector.process_frame(detect_frame)
+                if len(detections) == 0:
+                    empty_frames += 1
+                    if empty_frames >= REMOVAL_THRESHOLD:
+                        print("  (Darts removed — ready for next round)\n")
+                        detector.reset()
+                        state = State.WAITING
+                        last_score_label = None
+                        empty_frames = 0
+                else:
+                    empty_frames = 0
 
-                if detections:
-                    for det in detections:
-                        tip = det['tip']
-                        # Offset tip back to full-frame coordinates
-                        if board_roi is not None:
-                            tip = (tip[0] + roi_x0, tip[1] + roi_y0)
-                        score_info = board.score_from_camera(tip, homography)
-                        last_score_info = score_info
+            # --- Draw HUD ---
+            if args.debug:
+                display = detector.get_debug_frame(display, detections)
 
-                        print(f">>> DART: {score_info['label']}")
-
-                        if game:
-                            remaining, bust = game.add_score(score_info['score'])
-                            if bust:
-                                print(f"    (Bust — score voided)")
-                            else:
-                                print(f"    {game.get_display_text()}")
-                            if game.is_finished():
-                                print(f"\n*** GAME OVER! {game_mode} completed in {game.darts_thrown} darts! ***\n")
-
-                        log_detection(score_info, tip, game_mode,
-                                     game.remaining if game else None)
-
-                    # Absorb again after new darts detected (use cropped frame)
-                    gray_detect = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
-                    detector.absorb_current_scene(gray_detect)
-
-                # Check if all darts removed (use cropped frame)
-                gray_detect = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
-                removed = detector.dart_removed(gray_detect)
-                if removed and len(detector.confirmed_darts) == 0:
-                    print("  (Darts removed — ready for next throw)\n")
-                    state = State.WAITING
-                    last_score_info = None
-
-            # --- Draw HUD overlay ---
-
-            # Show last score
-            if last_score_info:
-                label = last_score_info['label']
-                cv2.putText(display, label, (10, 40),
+            if last_score_label:
+                cv2.putText(display, last_score_label, (10, 40),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
 
-            # Show game info
             if game:
-                game_text = game.get_display_text()
-                cv2.putText(display, game_text, (10, 80),
+                cv2.putText(display, game.get_display_text(), (10, 80),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 if game.is_finished():
                     cv2.putText(display, "GAME OVER!", (10, 120),
                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
 
-            # Show state
-            state_text = f"State: {state.name}"
+            # State + dart count
+            state_text = f"{state.name} | Darts: {detector.round_dart_count}/3"
             h_disp = display.shape[0]
             cv2.putText(display, state_text, (10, h_disp - 20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
-            # Draw confirmed dart tips
-            for blob_id, dart in detector.confirmed_darts.items():
-                tx, ty = dart['tip']
-                # Offset from cropped to full-frame coords for display
-                if board_roi is not None:
-                    tx, ty = tx + roi_x0, ty + roi_y0
-                cv2.circle(display, (tx, ty), 8, (0, 0, 255), 2)
-                cv2.circle(display, (tx, ty), 2, (0, 0, 255), -1)
-
-            # Debug overlay — build on cropped frame, blit back onto display
-            if args.debug:
-                debug_cropped = detector.get_debug_frame(detect_frame, [])
-                if board_roi is not None:
-                    display[roi_y0:roi_y1, roi_x0:roi_x1] = debug_cropped
-                else:
-                    display = debug_cropped
+            # Draw confirmed dart markers
+            for ordinal, dart in detector.confirmed_darts.items():
+                tx, ty = dart["tip"]
+                colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
+                color = colors.get(ordinal, (255, 255, 255))
+                cv2.circle(display, (tx, ty), 8, color, 2)
+                cv2.circle(display, (tx, ty), 2, color, -1)
 
             cv2.imshow(window, display)
 
-            # --- Key handling ---
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 print("Quitting.")
@@ -324,33 +264,11 @@ def main():
                     print(f"Remaining: {game.remaining}\n")
                 detector.reset()
                 state = State.WAITING
-                last_score_info = None
-                print("Detector reset.\n")
-            elif key == ord('c'):
-                print("Recalibrating board...")
-                if calibrate_board(cap, debug=args.debug):
-                    hom_data = np.load(str(homography_path))
-                    homography = hom_data['homography']
-                    ellipse_center = tuple(hom_data['ellipse_center'])
-                    board_roi = tuple(hom_data['board_roi'].astype(int)) if 'board_roi' in hom_data else None
-                    if board_roi is not None:
-                        roi_x0, roi_y0, roi_x1, roi_y1 = board_roi
-                        detector_center = (int(ellipse_center[0]) - roi_x0, int(ellipse_center[1]) - roi_y0)
-                    else:
-                        detector_center = (int(ellipse_center[0]), int(ellipse_center[1]))
-                    detector.board_center = detector_center
-                    detector.reset()
-                    state = State.WAITING
-                    last_score_info = None
-                    print("Board recalibrated successfully.\n")
-                else:
-                    print("Board recalibration failed.\n")
+                last_score_label = None
+                print("Round reset.\n")
             elif key == ord('d'):
                 args.debug = not args.debug
-                detector.debug = args.debug
                 print(f"Debug: {'ON' if args.debug else 'OFF'}")
-                if not args.debug:
-                    cv2.destroyWindow("Diff Mask")
 
     except KeyboardInterrupt:
         print("\nInterrupted — exiting.")
