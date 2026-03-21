@@ -293,15 +293,9 @@ def record_samples(device=None, rms_threshold=0.01):
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, win_w, win_h)
 
-    # Find an output device for playback
-    playback_device = None
-    try:
-        default_out = sd.query_devices(kind='output')
-        playback_device = default_out['index'] if 'index' in default_out else sd.default.device[1]
-    except Exception:
-        playback_device = None
-    if playback_device is not None:
-        print(f"Playback device: {sd.query_devices(playback_device)['name']}")
+    import subprocess
+    import tempfile
+    import wave
 
     # States
     STATE_LISTENING = 0
@@ -314,19 +308,35 @@ def record_samples(device=None, rms_threshold=0.01):
     last_trigger_time = 0.0
     cooldown = 0.8  # seconds between auto-detections
 
+    _play_proc = [None]
+
     def play_clip(clip):
-        """Play an audio clip on the default output device."""
-        if playback_device is None or clip is None:
+        """Play an audio clip via paplay (PipeWire/PulseAudio), normalized."""
+        if clip is None:
             return
+        # Kill any previous playback
+        if _play_proc[0] is not None and _play_proc[0].poll() is None:
+            _play_proc[0].kill()
         is_playing[0] = True
-        def finished_callback():
-            is_playing[0] = False
         try:
-            # Amplify for audibility (webcam mic clips are quiet)
             peak = np.max(np.abs(clip))
-            gain = min(0.8 / peak, 20.0) if peak > 0 else 1.0
-            amplified = (clip * gain).astype(np.float32)
-            sd.play(amplified, samplerate=SAMPLE_RATE, device=playback_device)
+            if peak > 0:
+                normalized = clip / peak * 0.9
+            else:
+                normalized = clip
+            int16_data = (normalized * 32767).astype(np.int16)
+
+            wav_path = os.path.join(tempfile.gettempdir(), "dart_preview.wav")
+            with wave.open(wav_path, 'w') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(int16_data.tobytes())
+
+            _play_proc[0] = subprocess.Popen(
+                ["paplay", wav_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
         except Exception as e:
             print(f"  Playback error: {e}")
             is_playing[0] = False
@@ -443,6 +453,10 @@ def record_samples(device=None, rms_threshold=0.01):
                     cv2.putText(canvas, "D=dart  N=noise  P=play  ESC=skip",
                                 (20, stats_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
+                # Update playback status
+                if is_playing[0] and _play_proc[0] is not None:
+                    if _play_proc[0].poll() is not None:
+                        is_playing[0] = False
                 if is_playing[0]:
                     stats_y += 25
                     cv2.putText(canvas, "Playing...", (20, stats_y),
