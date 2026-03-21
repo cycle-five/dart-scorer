@@ -37,7 +37,6 @@ import json
 import os
 import sys
 import time
-import threading
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
@@ -52,122 +51,7 @@ from classes import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Audio trigger
-# ---------------------------------------------------------------------------
-
-class AudioTrigger:
-    """Monitors a microphone for sudden amplitude spikes (dart impacts)."""
-
-    def __init__(self, device=None, threshold=0.15, cooldown=1.0, samplerate=44100, blocksize=1024):
-        """
-        Args:
-            device: Audio input device index. None = auto-detect eMeet C950.
-            threshold: RMS amplitude threshold to trigger (0.0-1.0).
-            cooldown: Seconds to wait after a trigger before allowing another.
-            samplerate: Audio sample rate.
-            blocksize: Samples per audio callback block.
-        """
-        self.threshold = threshold
-        self.cooldown = cooldown
-        self.samplerate = samplerate
-        self.blocksize = blocksize
-        self.triggered = False
-        self._last_trigger_time = 0.0
-        self._stream = None
-        self._current_rms = 0.0
-        self._peak_rms = 0.0  # highest RMS seen recently
-        self._baseline_rms = 0.01  # running baseline noise level
-        self._device = device
-        self._rms_history = []  # rolling history for waveform display
-        self._history_max = 200  # number of samples to keep
-
-    def _find_emeet_device(self):
-        """Auto-detect the eMeet C950 mic device index."""
-        import sounddevice as sd
-        devices = sd.query_devices()
-        for i, d in enumerate(devices):
-            if d['max_input_channels'] > 0 and 'eMeet' in d.get('name', ''):
-                return i
-        return None
-
-    def start(self):
-        """Start listening. Returns True if mic was found and started."""
-        try:
-            import sounddevice as sd
-        except ImportError:
-            print("WARNING: sounddevice not installed — audio trigger disabled")
-            return False
-
-        device = self._device
-        if device is None:
-            device = self._find_emeet_device()
-            if device is None:
-                print("WARNING: eMeet C950 mic not found — audio trigger disabled")
-                print("  Use --audio-device N to specify a device, or --no-audio to skip")
-                return False
-
-        device_info = sd.query_devices(device)
-        print(f"Audio trigger: {device_info['name']} (device {device})")
-        print(f"  Threshold: {self.threshold:.2f}, cooldown: {self.cooldown}s")
-
-        def callback(indata, frames, time_info, status):
-            rms = float(np.sqrt(np.mean(indata ** 2)))
-            self._current_rms = rms
-
-            # Track peak (decays slowly)
-            if rms > self._peak_rms:
-                self._peak_rms = rms
-            else:
-                self._peak_rms = max(rms, self._peak_rms * 0.995)
-
-            # Rolling history for waveform
-            self._rms_history.append(rms)
-            if len(self._rms_history) > self._history_max:
-                self._rms_history.pop(0)
-
-            # Update baseline with slow-moving average (ignore spikes)
-            if rms < self._baseline_rms * 3:
-                self._baseline_rms = 0.99 * self._baseline_rms + 0.01 * rms
-
-            # Trigger if RMS exceeds threshold AND we're past cooldown
-            now = time.monotonic()
-            if (rms > self.threshold
-                    and rms > self._baseline_rms * 5
-                    and now - self._last_trigger_time > self.cooldown):
-                self.triggered = True
-                self._last_trigger_time = now
-
-        try:
-            self._stream = sd.InputStream(
-                device=device,
-                channels=1,
-                samplerate=self.samplerate,
-                blocksize=self.blocksize,
-                callback=callback,
-            )
-            self._stream.start()
-            return True
-        except Exception as e:
-            print(f"WARNING: Could not open audio device: {e}")
-            return False
-
-    def check_and_reset(self):
-        """Check if a trigger occurred. Resets the flag."""
-        if self.triggered:
-            self.triggered = False
-            return True
-        return False
-
-    def stop(self):
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-    @property
-    def current_rms(self):
-        return self._current_rms
+from audio_trigger import DartAudioTrigger
 
 
 # ---------------------------------------------------------------------------
@@ -265,10 +149,10 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
     else:
         print("No board homography — you'll type segments manually")
 
-    # Audio trigger setup
+    # Audio trigger setup (ML-based)
     audio = None
     if use_audio:
-        audio = AudioTrigger(device=audio_device, threshold=audio_threshold)
+        audio = DartAudioTrigger(device=audio_device, prob_threshold=audio_threshold)
         if not audio.start():
             audio = None
 
@@ -281,7 +165,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
     print(f"Continuing from frame {frame_counter}")
     print(f"Box size: {box_size}x{box_size}px")
     if audio:
-        print(f"Audio trigger: ACTIVE (threshold={audio.threshold:.2f})")
+        print(f"Audio trigger: ACTIVE (prob_threshold={audio.prob_threshold:.2f})")
     else:
         print("Audio trigger: OFF (use SPACE to capture)")
     print()
@@ -325,15 +209,15 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                 display = frame.copy()
                 h, w = display.shape[:2]
 
-                # Audio debug panel — scrolling waveform + meters
+                # Audio debug panel — RMS waveform + dart probability
                 if audio:
                     rms = audio.current_rms
-                    peak = audio._peak_rms
-                    baseline = audio._baseline_rms
-                    history = audio._rms_history
+                    prob = audio.current_prob
+                    rms_history = audio._rms_history
+                    prob_history = audio._prob_history
 
                     # Panel dimensions
-                    panel_w, panel_h = 300, 100
+                    panel_w, panel_h = 300, 120
                     panel_x = w - panel_w - 10
                     panel_y = 10
 
@@ -344,40 +228,54 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                                   (0, 0, 0), -1)
                     cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
 
-                    # Auto-scale: use max of (threshold*2, peak) so the view adapts
-                    y_scale = max(audio.threshold * 2, peak * 1.2, 0.05)
+                    # Top half: RMS waveform
+                    rms_area_h = panel_h // 2 - 5
+                    rms_top = panel_y + 2
+                    peak = audio._peak_rms
+                    y_scale = max(peak * 1.2, 0.05)
 
-                    # Draw threshold line (yellow)
-                    thresh_y = panel_y + panel_h - int((audio.threshold / y_scale) * (panel_h - 20))
-                    thresh_y = max(panel_y + 12, min(panel_y + panel_h - 2, thresh_y))
+                    if len(rms_history) > 1:
+                        hmax = audio._history_max
+                        for i in range(1, len(rms_history)):
+                            x1 = panel_x + int((i - 1) / hmax * panel_w)
+                            x2 = panel_x + int(i / hmax * panel_w)
+                            y1 = rms_top + rms_area_h - int((rms_history[i-1] / y_scale) * rms_area_h)
+                            y2 = rms_top + rms_area_h - int((rms_history[i] / y_scale) * rms_area_h)
+                            y1 = max(rms_top, min(rms_top + rms_area_h, y1))
+                            y2 = max(rms_top, min(rms_top + rms_area_h, y2))
+                            cv2.line(display, (x1, y1), (x2, y2), (0, 200, 0), 1)
+
+                    cv2.putText(display, f"RMS={rms:.4f}", (panel_x + 2, rms_top + 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 200, 0), 1)
+
+                    # Bottom half: Dart probability
+                    prob_top = rms_top + rms_area_h + 10
+                    prob_area_h = rms_area_h
+
+                    # Threshold line (yellow)
+                    thresh_y = prob_top + prob_area_h - int(audio.prob_threshold * prob_area_h)
+                    thresh_y = max(prob_top, min(prob_top + prob_area_h, thresh_y))
                     cv2.line(display, (panel_x, thresh_y), (panel_x + panel_w, thresh_y),
                              (0, 255, 255), 1)
-                    cv2.putText(display, f"thresh={audio.threshold:.3f}",
-                                (panel_x + 2, thresh_y - 3),
+                    cv2.putText(display, f"thresh={audio.prob_threshold:.2f}",
+                                (panel_x + panel_w - 90, thresh_y - 3),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 255), 1)
 
-                    # Draw baseline line (dim gray)
-                    base_y = panel_y + panel_h - int((baseline / y_scale) * (panel_h - 20))
-                    base_y = max(panel_y + 12, min(panel_y + panel_h - 2, base_y))
-                    cv2.line(display, (panel_x, base_y), (panel_x + panel_w, base_y),
-                             (80, 80, 80), 1)
-
-                    # Draw scrolling waveform
-                    if len(history) > 1:
-                        for i in range(1, len(history)):
-                            x1 = panel_x + int((i - 1) / audio._history_max * panel_w)
-                            x2 = panel_x + int(i / audio._history_max * panel_w)
-                            y1 = panel_y + panel_h - int((history[i-1] / y_scale) * (panel_h - 20))
-                            y2 = panel_y + panel_h - int((history[i] / y_scale) * (panel_h - 20))
-                            y1 = max(panel_y + 2, min(panel_y + panel_h - 2, y1))
-                            y2 = max(panel_y + 2, min(panel_y + panel_h - 2, y2))
-                            color = (0, 0, 255) if history[i] > audio.threshold else (0, 200, 0)
+                    if len(prob_history) > 1:
+                        hmax = audio._history_max
+                        for i in range(1, len(prob_history)):
+                            x1 = panel_x + int((i - 1) / hmax * panel_w)
+                            x2 = panel_x + int(i / hmax * panel_w)
+                            y1 = prob_top + prob_area_h - int(prob_history[i-1] * prob_area_h)
+                            y2 = prob_top + prob_area_h - int(prob_history[i] * prob_area_h)
+                            y1 = max(prob_top, min(prob_top + prob_area_h, y1))
+                            y2 = max(prob_top, min(prob_top + prob_area_h, y2))
+                            color = (0, 0, 255) if prob_history[i] > audio.prob_threshold else (200, 100, 0)
                             cv2.line(display, (x1, y1), (x2, y2), color, 1)
 
-                    # Current/peak RMS text
-                    cv2.putText(display, f"RMS={rms:.4f}  peak={peak:.4f}  base={baseline:.4f}",
-                                (panel_x + 2, panel_y + panel_h + 14),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+                    prob_color = (0, 0, 255) if prob > audio.prob_threshold else (200, 100, 0)
+                    cv2.putText(display, f"P(dart)={prob:.2f}", (panel_x + 2, prob_top + 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, prob_color, 1)
 
                 cv2.putText(display, f"LIVE  |  Saved: {frame_counter}  |  Dart: {_dart_ordinal}/3",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
@@ -398,12 +296,12 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     print("Round reset — dart 1")
                 elif key == ord('+') or key == ord('='):
                     if audio:
-                        audio.threshold = min(audio.threshold + 0.02, 1.0)
-                        print(f"  Audio threshold: {audio.threshold:.2f}")
+                        audio.prob_threshold = min(audio.prob_threshold + 0.05, 0.99)
+                        print(f"  Dart prob threshold: {audio.prob_threshold:.2f}")
                 elif key == ord('-'):
                     if audio:
-                        audio.threshold = max(audio.threshold - 0.02, 0.01)
-                        print(f"  Audio threshold: {audio.threshold:.2f}")
+                        audio.prob_threshold = max(audio.prob_threshold - 0.05, 0.1)
+                        print(f"  Dart prob threshold: {audio.prob_threshold:.2f}")
 
                 if should_capture:
                     frozen_frame = frame.copy()
@@ -596,8 +494,8 @@ if __name__ == "__main__":
                         help="Disable audio trigger, use SPACE only")
     parser.add_argument("--audio-device", type=int, default=None,
                         help="Audio input device index (default: auto-detect eMeet)")
-    parser.add_argument("--audio-threshold", type=float, default=0.15,
-                        help="Audio RMS trigger threshold (default: 0.15)")
+    parser.add_argument("--audio-threshold", type=float, default=0.7,
+                        help="Dart probability threshold for trigger (default: 0.7)")
     args = parser.parse_args()
 
     collect_data(
