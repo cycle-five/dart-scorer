@@ -78,6 +78,7 @@ class VideoTrigger:
         self._diff_history = []
         self._history_max = 200
         self._suppress_calm_count = 0
+        self._saw_pull_disturbance = False
 
     def _to_thumb(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -122,8 +123,17 @@ class VideoTrigger:
             self._suppress_calm_count = 0
         return self._suppress_calm_count >= self.SUPPRESS_CALM_REQUIRED
 
+    def saw_disturbance(self):
+        """Check if a significant disturbance occurred (hand reaching in)."""
+        return self._current_diff > self.threshold
+
     def reset_calm_counter(self):
         self._suppress_calm_count = 0
+        self._saw_pull_disturbance = False
+
+    @property
+    def pull_disturbance_seen(self):
+        return self._saw_pull_disturbance
 
     def absorb(self, frame):
         """Reset background to current frame."""
@@ -332,7 +342,7 @@ def render_control_panel(state, video, audio, session, frame_counter,
         UIState.SETTLING: (f"DART! Settling {settle_remaining:.1f}s", (0, 200, 255)),
         UIState.COLLECTING: (f"COLLECTING — {len(batch_frames)}/3 captured ({collect_remaining:.0f}s)", (0, 200, 255)),
         UIState.ANNOTATING: (f"ANNOTATING — frame {batch_index+1}/{len(batch_frames)}", (0, 0, 255)),
-        UIState.PULL_DARTS: ("PULL DARTS — waiting for stable", (0, 140, 255)),
+        UIState.PULL_DARTS: ("PULL DARTS — " + ("waiting for pull" if video and not video._saw_pull_disturbance else "stabilizing...") if video else "PULL DARTS", (0, 140, 255)),
     }
     text, color = state_info.get(state, ("", (255, 255, 255)))
     cv2.putText(cp, text, (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
@@ -624,9 +634,17 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
 
             elif state == UIState.PULL_DARTS:
                 if video:
-                    if video.is_calm():
-                        state = UIState.LISTENING
-                        print("  Board stable — listening")
+                    # Phase 1: wait for the hand/darts disturbance
+                    if not video._saw_pull_disturbance:
+                        if video.saw_disturbance():
+                            video._saw_pull_disturbance = True
+                            video._suppress_calm_count = 0
+                            print("  Darts being pulled...")
+                    else:
+                        # Phase 2: wait for board to stabilize after pull
+                        if video.is_calm():
+                            state = UIState.LISTENING
+                            print("  Board stable — listening")
                 else:
                     if time.monotonic() - cooldown_start >= 3.0:
                         state = UIState.LISTENING
