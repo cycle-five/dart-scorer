@@ -577,6 +577,163 @@ def calibrate_board(cap, debug=False):
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — Crop ROI selection
+# ---------------------------------------------------------------------------
+
+def load_crop_roi():
+    """Load and return the crop ROI (x, y, w, h) or None if not set."""
+    path = config.CROP_ROI_PATH
+    if not path.exists():
+        return None
+    data = np.load(str(path))
+    roi = data["crop_roi"]
+    return tuple(int(v) for v in roi)
+
+
+def apply_crop(frame, crop_roi):
+    """Crop a frame to the saved ROI. Returns cropped frame."""
+    if crop_roi is None:
+        return frame
+    x, y, w, h = crop_roi
+    return frame[y:y+h, x:x+w].copy()
+
+
+_crop_dragging = False
+_crop_start = None
+_crop_rect = None
+
+
+def _crop_mouse_callback(event, x, y, flags, param):
+    global _crop_dragging, _crop_start, _crop_rect
+    if event == cv2.EVENT_LBUTTONDOWN:
+        _crop_dragging = True
+        _crop_start = (x, y)
+        _crop_rect = None
+    elif event == cv2.EVENT_MOUSEMOVE and _crop_dragging:
+        _crop_rect = (_crop_start[0], _crop_start[1], x, y)
+    elif event == cv2.EVENT_LBUTTONUP and _crop_dragging:
+        _crop_dragging = False
+        _crop_rect = (_crop_start[0], _crop_start[1], x, y)
+
+
+def calibrate_crop(cap, debug=False):
+    """Interactive crop ROI selection.
+
+    Draw a rectangle on the live camera feed to select the region of
+    interest (just the dartboard + some margin). The crop is applied
+    before all other processing in the pipeline.
+    """
+    global _crop_dragging, _crop_start, _crop_rect
+
+    print("\n=== Crop ROI Selection ===")
+    print("Draw a rectangle around the dartboard area.")
+    print("Controls:")
+    print("  Click+drag  Draw crop rectangle")
+    print("  ENTER       Accept and save")
+    print("  R           Reset rectangle")
+    print("  Q           Abort")
+    print()
+
+    window = "Select Crop Region"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window, _crop_mouse_callback)
+
+    _crop_rect = None
+    _crop_dragging = False
+    _crop_start = None
+
+    # Load existing crop for reference
+    existing_roi = load_crop_roi()
+    if existing_roi is not None:
+        x, y, w, h = existing_roi
+        _crop_rect = (x, y, x + w, y + h)
+        print(f"Existing crop: ({x}, {y}) {w}x{h} — adjust or ENTER to keep")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("ERROR: Failed to read frame.")
+                return False
+
+            display = frame.copy()
+            h_frame, w_frame = display.shape[:2]
+
+            # Draw current rectangle
+            if _crop_rect is not None:
+                x1, y1, x2, y2 = _crop_rect
+                # Normalize coordinates
+                rx1, rx2 = min(x1, x2), max(x1, x2)
+                ry1, ry2 = min(y1, y2), max(y1, y2)
+                rx1 = max(0, rx1)
+                ry1 = max(0, ry1)
+                rx2 = min(w_frame, rx2)
+                ry2 = min(h_frame, ry2)
+
+                # Dim outside the rectangle
+                overlay = display.copy()
+                overlay[:ry1, :] = overlay[:ry1, :] // 3
+                overlay[ry2:, :] = overlay[ry2:, :] // 3
+                overlay[ry1:ry2, :rx1] = overlay[ry1:ry2, :rx1] // 3
+                overlay[ry1:ry2, rx2:] = overlay[ry1:ry2, rx2:] // 3
+                display = overlay
+
+                cv2.rectangle(display, (rx1, ry1), (rx2, ry2), (0, 255, 0), 2)
+                size_text = f"{rx2 - rx1}x{ry2 - ry1}"
+                cv2.putText(display, size_text, (rx1, ry1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            cv2.putText(display, "Draw rectangle around dartboard | ENTER=save  R=reset  Q=abort",
+                        (10, h_frame - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+            cv2.imshow(window, display)
+            key = cv2.waitKey(30) & 0xFF
+
+            if key == ord('q'):
+                print("Aborted.")
+                cv2.destroyWindow(window)
+                return False
+
+            elif key == ord('r'):
+                _crop_rect = None
+                print("  Rectangle reset")
+
+            elif key in (13, 10):  # ENTER
+                if _crop_rect is None:
+                    print("  No rectangle drawn — draw one first")
+                    continue
+
+                x1, y1, x2, y2 = _crop_rect
+                rx1, rx2 = min(x1, x2), max(x1, x2)
+                ry1, ry2 = min(y1, y2), max(y1, y2)
+                rx1 = max(0, rx1)
+                ry1 = max(0, ry1)
+                rx2 = min(w_frame, rx2)
+                ry2 = min(h_frame, ry2)
+
+                crop_w = rx2 - rx1
+                crop_h = ry2 - ry1
+                if crop_w < 100 or crop_h < 100:
+                    print(f"  Rectangle too small ({crop_w}x{crop_h}) — draw a larger one")
+                    continue
+
+                roi = np.array([rx1, ry1, crop_w, crop_h], dtype=np.int32)
+                save_path = config.CROP_ROI_PATH
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez(str(save_path), crop_roi=roi)
+                print(f"Crop ROI saved: ({rx1}, {ry1}) {crop_w}x{crop_h}")
+                print(f"  Saved to {save_path}")
+
+                cv2.destroyWindow(window)
+                return True
+
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        cv2.destroyWindow(window)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -584,10 +741,11 @@ def main():
     parser = argparse.ArgumentParser(description="Dartboard calibration tool")
     parser.add_argument("--lens",  action="store_true", help="Run lens distortion calibration")
     parser.add_argument("--board", action="store_true", help="Run board homography calibration")
+    parser.add_argument("--crop",  action="store_true", help="Select crop ROI (dartboard region)")
     parser.add_argument("--debug", action="store_true", help="Show debug visualizations")
     args = parser.parse_args()
 
-    if not args.lens and not args.board:
+    if not args.lens and not args.board and not args.crop:
         parser.print_help()
         sys.exit(1)
 
@@ -597,6 +755,10 @@ def main():
         if args.lens:
             if not calibrate_lens(cap, debug=args.debug):
                 print("Lens calibration failed. Aborting.")
+                return
+        if args.crop:
+            if not calibrate_crop(cap, debug=args.debug):
+                print("Crop ROI selection failed.")
                 return
         if args.board:
             calibrate_board(cap, debug=args.debug)

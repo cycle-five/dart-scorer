@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(os.path.dirname(__file__))
 # Camera
 # ---------------------------------------------------------------------------
 
-# V4L2 device node for the eMeet C950 HD webcam (ceiling-mounted)
+# V4L2 device node for the eMeet C950 HD webcam
 CAMERA_DEVICE = "/dev/video2"
 
 # Native capture resolution of the eMeet C950
@@ -34,6 +34,10 @@ LENS_PARAMS_PATH = PROJECT_ROOT / "data" / "lens_params.npz"
 # Homography matrix that maps the distortion-corrected frame to the canonical
 # top-down dartboard view
 BOARD_HOMOGRAPHY_PATH = PROJECT_ROOT / "data" / "board_homography.npz"
+
+# Crop region (x, y, w, h) saved by calibrate.py --crop
+# Applied before all processing to reduce frame to just the dartboard area
+CROP_ROI_PATH = PROJECT_ROOT / "data" / "crop_roi.npz"
 
 # ---------------------------------------------------------------------------
 # Checkerboard calibration

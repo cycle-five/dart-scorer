@@ -129,8 +129,14 @@ def main():
         lens_params = load_lens_params()
         print("Lens undistortion enabled")
 
+    # --- Crop ROI ---
+    from calibrate import open_camera, load_crop_roi, apply_crop
+    crop_roi = load_crop_roi()
+    if crop_roi is not None:
+        x, y, w, h = crop_roi
+        print(f"Crop ROI: ({x}, {y}) {w}x{h}")
+
     # --- Setup ---
-    from calibrate import open_camera
     cap = open_camera()
     init_csv_log()
 
@@ -163,9 +169,10 @@ def main():
                 print("ERROR: Failed to read frame.")
                 break
 
-            # Optional undistortion
+            # Optional undistortion + crop
             if lens_params is not None:
                 frame = undistort_frame(frame, *lens_params)
+            frame = apply_crop(frame, crop_roi)
 
             display = frame.copy()
 

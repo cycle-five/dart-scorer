@@ -6,21 +6,24 @@ Captures camera frames and lets the user annotate dart tips with their
 board segment (e.g. T20, S5, D_BULL). Tracks dart ordinal (1st/2nd/3rd)
 automatically within each round. Saves images and YOLO-format labels.
 
-Audio trigger: listens to the camera mic for the "thud" of a dart hitting
-the board and auto-freezes the frame for annotation. Falls back to manual
-SPACE capture if --no-audio is set or the mic isn't available.
+Trigger modes for auto-capture:
+  audio  — ML classifier on camera mic detects dart impact sound (default)
+  video  — frame differencing detects visual change (dart appearing on board)
+  manual — SPACE key only
 
 Board homography (if calibrated) provides a segment guess when you click a
 tip, so you can just press ENTER to accept or type a correction.
 
 Usage:
-    python collect.py                          # Start collecting (audio trigger on)
-    python collect.py --no-audio               # Manual SPACE capture only
+    python collect.py                          # Audio trigger (default)
+    python collect.py --trigger video          # Video trigger (frame diff)
+    python collect.py --trigger manual         # SPACE only
     python collect.py --audio-device 9         # Specific mic device index
-    python collect.py --audio-threshold 0.15   # Adjust trigger sensitivity
+    python collect.py --audio-threshold 0.7    # Adjust audio prob threshold
+    python collect.py --video-threshold 5.0    # Adjust video diff threshold
 
 Controls:
-    (auto)  Frame freezes on dart impact sound
+    (auto)  Frame freezes on dart impact / visual change
     SPACE   Manual capture/freeze (always available)
     Click   Mark a dart tip (while frozen) — auto-guesses segment if calibrated
     ENTER   Accept guess (or type correction first, then ENTER)
@@ -28,7 +31,7 @@ Controls:
     ENTER   Save annotated frame (when no pending click)
     ESC     Discard current capture and resume live feed
     R       Reset round (back to dart 1)
-    +/-     Adjust audio threshold up/down
+    +/-     Adjust trigger threshold up/down
     Q       Quit
 """
 
@@ -52,6 +55,138 @@ from classes import (
 
 
 from audio_trigger import DartAudioTrigger
+from window_manager import create_window, save_window_sizes
+
+
+# ---------------------------------------------------------------------------
+# Video trigger (frame differencing)
+# ---------------------------------------------------------------------------
+
+class VideoTrigger:
+    """Detects darts by frame differencing on heavily downsampled frames.
+
+    Downsampling averages out per-pixel sensor noise while preserving
+    dart-sized changes. We count how many coarse cells changed significantly
+    rather than taking the mean diff — a dart changes a handful of cells
+    by a lot, while sensor noise changes many cells by tiny amounts.
+    """
+
+    THUMB_SIZE = (80, 60)  # aggressive downsample — each cell ~24x18px at 1080p
+    CELL_THRESHOLD = 12    # per-cell intensity change to count as "changed"
+
+    def __init__(self, threshold=8, cooldown=1.5, warmup=None):
+        """
+        Args:
+            threshold: Number of changed cells above baseline to trigger.
+            cooldown: Seconds between triggers.
+            warmup: Seconds before triggering is enabled (default: 5s).
+        """
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self._warmup_seconds = warmup if warmup is not None else 5.0
+        self._background = None
+        self._frame_count = 0
+        self._start_time = time.monotonic()
+        self._last_trigger_time = 0.0
+        self._current_diff = 0.0  # changed cells above baseline
+        self._baseline_diff = 0.0
+        self._raw_changed = 0     # raw count of changed cells
+        self._diff_history = []
+        self._history_max = 200
+        self.triggered = False
+        # Suppression: skip triggers while diff is elevated
+        self._suppressed = False
+        self._suppress_message = ""
+
+    def _to_thumb(self, frame):
+        """Convert frame to small grayscale thumbnail."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, self.THUMB_SIZE, interpolation=cv2.INTER_AREA)
+
+    def update(self, frame):
+        """Feed a new frame."""
+        thumb = self._to_thumb(frame)
+        self._frame_count += 1
+
+        if self._background is None:
+            self._background = thumb.astype(np.float32)
+            return
+
+        # Slow-adapting background
+        cv2.accumulateWeighted(thumb, self._background, 0.02)
+        bg = self._background.astype(np.uint8)
+
+        # Count cells that changed more than CELL_THRESHOLD
+        diff = cv2.absdiff(thumb, bg)
+        changed_cells = int(np.sum(diff > self.CELL_THRESHOLD))
+        self._raw_changed = changed_cells
+
+        # Track baseline (noise floor of changed cell count)
+        if changed_cells < self._baseline_diff * 3 + 2:
+            self._baseline_diff = 0.95 * self._baseline_diff + 0.05 * changed_cells
+
+        spike = max(0, changed_cells - self._baseline_diff)
+        self._current_diff = spike
+
+        self._diff_history.append(spike)
+        if len(self._diff_history) > self._history_max:
+            self._diff_history.pop(0)
+
+        now = time.monotonic()
+        elapsed = now - self._start_time
+
+        # During warmup, don't trigger
+        if elapsed < self._warmup_seconds:
+            return
+
+        # If suppressed, wait until diff drops back to near baseline
+        if self._suppressed:
+            if spike < self.threshold * 0.5:
+                self._suppressed = False
+                self._suppress_message = ""
+            return
+
+        # Trigger on spike
+        if (spike > self.threshold
+                and now - self._last_trigger_time > self.cooldown):
+            self.triggered = True
+            self._last_trigger_time = now
+
+    def suppress_next(self, message="Suppressing trigger..."):
+        """Suppress triggers until diff drops back to baseline.
+
+        Use after 3rd dart to skip the removal event.
+        """
+        self._suppressed = True
+        self._suppress_message = message
+
+    @property
+    def is_suppressed(self):
+        return self._suppressed
+
+    @property
+    def suppress_message(self):
+        return self._suppress_message
+
+    @property
+    def warmup_remaining(self):
+        """Seconds of warmup remaining, or 0 if done."""
+        return max(0, self._warmup_seconds - (time.monotonic() - self._start_time))
+
+    def absorb(self, frame):
+        """Reset background to current frame."""
+        thumb = self._to_thumb(frame)
+        self._background = thumb.astype(np.float32)
+
+    def check_and_reset(self):
+        if self.triggered:
+            self.triggered = False
+            return True
+        return False
+
+    @property
+    def current_diff(self):
+        return self._current_diff
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +246,8 @@ def _mouse_callback(event, x, y, flags, param):
 # ---------------------------------------------------------------------------
 
 def collect_data(outdir="data/training", use_undistort=True, box_size=30,
-                 use_audio=True, audio_device=None, audio_threshold=0.15):
+                 trigger_mode="audio", audio_device=None, audio_threshold=0.7,
+                 video_threshold=5.0, settle_delay=0.7):
     global _click_point, _annotations, _text_input, _guess_segment, _active, _dart_ordinal
 
     outdir = Path(outdir)
@@ -130,7 +266,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
     frame_counter = existing
 
     # Camera setup
-    from calibrate import open_camera, load_lens_params, undistort_frame
+    from calibrate import open_camera, load_lens_params, undistort_frame, load_crop_roi, apply_crop
     cap = open_camera()
 
     lens_params = None
@@ -139,6 +275,13 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
         print("Lens undistortion enabled")
     elif use_undistort:
         print("WARNING: No lens params found, running without undistortion")
+
+    crop_roi = load_crop_roi()
+    if crop_roi is not None:
+        x, y, w, h = crop_roi
+        print(f"Crop ROI: ({x}, {y}) {w}x{h}")
+    else:
+        print("No crop ROI — using full frame")
 
     # Load board homography for segment guessing (optional)
     homography = None
@@ -149,15 +292,22 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
     else:
         print("No board homography — you'll type segments manually")
 
-    # Audio trigger setup (ML-based)
+    # Trigger setup
     audio = None
-    if use_audio:
+    video = None
+    if trigger_mode == "audio":
         audio = DartAudioTrigger(device=audio_device, prob_threshold=audio_threshold)
         if not audio.start():
             audio = None
+            print("Audio trigger failed — falling back to manual (SPACE)")
+    elif trigger_mode == "video":
+        video = VideoTrigger(threshold=video_threshold)
+        print(f"Video trigger: ACTIVE (threshold={video_threshold:.1f})")
 
     win = "Collect Training Data"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    panel_win = "Control Panel"
+    create_window(win, default_width=960, default_height=540)
+    create_window(panel_win, default_width=400, default_height=350)
     cv2.setMouseCallback(win, _mouse_callback, param=homography)
 
     print("\n=== YOLO Training Data Collection (186 classes) ===")
@@ -165,13 +315,16 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
     print(f"Continuing from frame {frame_counter}")
     print(f"Box size: {box_size}x{box_size}px")
     if audio:
-        print(f"Audio trigger: ACTIVE (prob_threshold={audio.prob_threshold:.2f})")
+        print(f"Trigger: AUDIO (prob_threshold={audio.prob_threshold:.2f})")
+    elif video:
+        print(f"Trigger: VIDEO (diff_threshold={video.threshold:.1f})")
     else:
-        print("Audio trigger: OFF (use SPACE to capture)")
+        print("Trigger: MANUAL (use SPACE to capture)")
     print()
     print("Controls:")
-    if audio:
-        print("  (auto)    Frame freezes on dart impact sound")
+    if audio or video:
+        trigger_desc = "dart impact sound" if audio else "visual change"
+        print(f"  (auto)    Frame freezes on {trigger_desc}")
     print("  SPACE     Manual capture")
     print("  Click     Mark a dart tip (while frozen)")
     print("  Type      Segment shorthand (t20, s5, dbull) then ENTER")
@@ -179,14 +332,24 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
     print("  ENTER     Save frame (when all darts labeled)")
     print("  ESC       Discard and resume")
     print("  R         Reset round to dart 1")
-    if audio:
-        print("  +/-       Adjust audio threshold")
+    if audio or video:
+        print("  +/-       Adjust trigger threshold")
     print("  Q         Quit")
     print()
 
     frozen_frame = None
     _active = False
     _dart_ordinal = 1
+
+    # Pre-capture delay: after trigger, keep reading frames for settle_delay
+    # then freeze the LATEST frame (not the blurry trigger frame)
+    pre_capture_active = False
+    pre_capture_start = 0.0
+    pre_capture_source = ""
+
+    # Post-capture settle: after unfreezing, suppress triggers briefly
+    settle_active = False
+    settle_start_time = 0.0
 
     try:
         while True:
@@ -200,97 +363,210 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                 frame = raw
                 if lens_params is not None:
                     frame = undistort_frame(raw, *lens_params)
+                frame = apply_crop(frame, crop_roi)
 
-                # Check audio trigger
+                # Check triggers
                 audio_fired = False
-                if audio and audio.check_and_reset():
-                    audio_fired = True
+                video_fired = False
+                # Always update video trigger
+                if video:
+                    video.update(frame)
+
+                if not settle_active and not pre_capture_active:
+                    if audio and audio.check_and_reset():
+                        audio_fired = True
+                    if video and video.check_and_reset():
+                        video_fired = True
 
                 display = frame.copy()
                 h, w = display.shape[:2]
 
-                # Audio debug panel — RMS waveform + dart probability
-                if audio:
-                    rms = audio.current_rms
-                    prob = audio.current_prob
+                # --- Control Panel (separate window) ---
+                cp_w, cp_h = 400, 350
+                cp = np.zeros((cp_h, cp_w, 3), dtype=np.uint8)
+                cp[:] = (30, 30, 30)
+                cp_y = 15
+
+                # Title
+                trigger_name = "VIDEO" if video else ("AUDIO" if audio else "MANUAL")
+                cv2.putText(cp, f"Trigger: {trigger_name}", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cp_y += 25
+
+                # Trigger waveform
+                wave_x, wave_w, wave_h = 10, cp_w - 20, 100
+                wave_y = cp_y
+                cv2.rectangle(cp, (wave_x, wave_y), (wave_x + wave_w, wave_y + wave_h),
+                              (50, 50, 50), -1)
+
+                if video:
+                    diff_history = video._diff_history
+                    y_scale = max(video.threshold * 2, max(diff_history) * 1.2 if diff_history else 1.0, 1.0)
+
+                    # Threshold line
+                    ty = wave_y + wave_h - int((video.threshold / y_scale) * wave_h)
+                    ty = max(wave_y + 1, min(wave_y + wave_h - 1, ty))
+                    cv2.line(cp, (wave_x, ty), (wave_x + wave_w, ty), (0, 255, 255), 1)
+
+                    if len(diff_history) > 1:
+                        hmax = video._history_max
+                        for i in range(1, len(diff_history)):
+                            x1 = wave_x + int((i - 1) / hmax * wave_w)
+                            x2 = wave_x + int(i / hmax * wave_w)
+                            y1 = wave_y + wave_h - int((diff_history[i-1] / y_scale) * wave_h)
+                            y2 = wave_y + wave_h - int((diff_history[i] / y_scale) * wave_h)
+                            y1 = max(wave_y + 1, min(wave_y + wave_h - 1, y1))
+                            y2 = max(wave_y + 1, min(wave_y + wave_h - 1, y2))
+                            color = (0, 0, 255) if diff_history[i] > video.threshold else (0, 180, 0)
+                            cv2.line(cp, (x1, y1), (x2, y2), color, 1)
+
+                    cp_y = wave_y + wave_h + 5
+                    cv2.putText(cp, f"cells={video.current_diff:.0f}  base={video._baseline_diff:.0f}  "
+                                f"raw={video._raw_changed}  thresh={video.threshold}",
+                                (wave_x, cp_y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+                    cp_y += 25
+
+                elif audio:
                     rms_history = audio._rms_history
                     prob_history = audio._prob_history
-
-                    # Panel dimensions
-                    panel_w, panel_h = 300, 120
-                    panel_x = w - panel_w - 10
-                    panel_y = 10
-
-                    # Semi-transparent background
-                    overlay = display.copy()
-                    cv2.rectangle(overlay, (panel_x, panel_y),
-                                  (panel_x + panel_w, panel_y + panel_h),
-                                  (0, 0, 0), -1)
-                    cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
-
-                    # Top half: RMS waveform
-                    rms_area_h = panel_h // 2 - 5
-                    rms_top = panel_y + 2
+                    rms = audio.current_rms
+                    prob = audio.current_prob
                     peak = audio._peak_rms
-                    y_scale = max(peak * 1.2, 0.05)
 
+                    # Top: RMS
+                    rms_h = wave_h // 2 - 3
+                    y_scale = max(peak * 1.2, 0.05)
                     if len(rms_history) > 1:
                         hmax = audio._history_max
                         for i in range(1, len(rms_history)):
-                            x1 = panel_x + int((i - 1) / hmax * panel_w)
-                            x2 = panel_x + int(i / hmax * panel_w)
-                            y1 = rms_top + rms_area_h - int((rms_history[i-1] / y_scale) * rms_area_h)
-                            y2 = rms_top + rms_area_h - int((rms_history[i] / y_scale) * rms_area_h)
-                            y1 = max(rms_top, min(rms_top + rms_area_h, y1))
-                            y2 = max(rms_top, min(rms_top + rms_area_h, y2))
-                            cv2.line(display, (x1, y1), (x2, y2), (0, 200, 0), 1)
-
-                    cv2.putText(display, f"RMS={rms:.4f}", (panel_x + 2, rms_top + 10),
+                            x1 = wave_x + int((i - 1) / hmax * wave_w)
+                            x2 = wave_x + int(i / hmax * wave_w)
+                            y1 = wave_y + rms_h - int((rms_history[i-1] / y_scale) * rms_h)
+                            y2 = wave_y + rms_h - int((rms_history[i] / y_scale) * rms_h)
+                            y1 = max(wave_y + 1, min(wave_y + rms_h, y1))
+                            y2 = max(wave_y + 1, min(wave_y + rms_h, y2))
+                            cv2.line(cp, (x1, y1), (x2, y2), (0, 200, 0), 1)
+                    cv2.putText(cp, f"RMS={rms:.4f}", (wave_x + 2, wave_y + 12),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 200, 0), 1)
 
-                    # Bottom half: Dart probability
-                    prob_top = rms_top + rms_area_h + 10
-                    prob_area_h = rms_area_h
-
-                    # Threshold line (yellow)
-                    thresh_y = prob_top + prob_area_h - int(audio.prob_threshold * prob_area_h)
-                    thresh_y = max(prob_top, min(prob_top + prob_area_h, thresh_y))
-                    cv2.line(display, (panel_x, thresh_y), (panel_x + panel_w, thresh_y),
-                             (0, 255, 255), 1)
-                    cv2.putText(display, f"thresh={audio.prob_threshold:.2f}",
-                                (panel_x + panel_w - 90, thresh_y - 3),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 255), 1)
+                    # Bottom: probability
+                    prob_y = wave_y + rms_h + 6
+                    prob_h = rms_h
+                    ty = prob_y + prob_h - int(audio.prob_threshold * prob_h)
+                    ty = max(prob_y, min(prob_y + prob_h, ty))
+                    cv2.line(cp, (wave_x, ty), (wave_x + wave_w, ty), (0, 255, 255), 1)
 
                     if len(prob_history) > 1:
                         hmax = audio._history_max
                         for i in range(1, len(prob_history)):
-                            x1 = panel_x + int((i - 1) / hmax * panel_w)
-                            x2 = panel_x + int(i / hmax * panel_w)
-                            y1 = prob_top + prob_area_h - int(prob_history[i-1] * prob_area_h)
-                            y2 = prob_top + prob_area_h - int(prob_history[i] * prob_area_h)
-                            y1 = max(prob_top, min(prob_top + prob_area_h, y1))
-                            y2 = max(prob_top, min(prob_top + prob_area_h, y2))
+                            x1 = wave_x + int((i - 1) / hmax * wave_w)
+                            x2 = wave_x + int(i / hmax * wave_w)
+                            y1 = prob_y + prob_h - int(prob_history[i-1] * prob_h)
+                            y2 = prob_y + prob_h - int(prob_history[i] * prob_h)
+                            y1 = max(prob_y, min(prob_y + prob_h, y1))
+                            y2 = max(prob_y, min(prob_y + prob_h, y2))
                             color = (0, 0, 255) if prob_history[i] > audio.prob_threshold else (200, 100, 0)
-                            cv2.line(display, (x1, y1), (x2, y2), color, 1)
+                            cv2.line(cp, (x1, y1), (x2, y2), color, 1)
 
                     prob_color = (0, 0, 255) if prob > audio.prob_threshold else (200, 100, 0)
-                    cv2.putText(display, f"P(dart)={prob:.2f}", (panel_x + 2, prob_top + 10),
+                    cv2.putText(cp, f"P(dart)={prob:.2f}", (wave_x + 2, prob_y + 12),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, prob_color, 1)
 
-                cv2.putText(display, f"LIVE  |  Saved: {frame_counter}  |  Dart: {_dart_ordinal}/3",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                trigger_hint = "AUTO+SPACE=capture" if audio else "SPACE=capture"
-                cv2.putText(display, f"{trigger_hint}  R=reset round  Q=quit",
-                            (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                    cp_y = wave_y + wave_h + 5
+                    cv2.putText(cp, f"thresh={audio.prob_threshold:.2f}",
+                                (wave_x, cp_y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
+                    cp_y += 25
+                else:
+                    cp_y = wave_y + wave_h + 5
+
+                # Status
+                cp_y += 10
+                # Determine state text
+                warmup_left = video.warmup_remaining if video else 0
+                if warmup_left > 0:
+                    state_text = f"WARMING UP... {warmup_left:.1f}s"
+                    state_color = (100, 100, 100)
+                elif video and video.is_suppressed:
+                    state_text = f"SUPPRESSED — {video.suppress_message}"
+                    state_color = (0, 140, 255)
+                elif pre_capture_active:
+                    remaining = max(0, settle_delay - (time.monotonic() - pre_capture_start))
+                    state_text = f"DART DETECTED — settling {remaining:.1f}s"
+                    state_color = (0, 200, 255)
+                elif settle_active:
+                    state_text = "COOLDOWN"
+                    state_color = (100, 100, 100)
+                else:
+                    state_text = "LISTENING"
+                    state_color = (0, 255, 0)
+                cv2.putText(cp, state_text, (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, state_color, 2)
+                cp_y += 25
+
+                cv2.putText(cp, f"Dart: {_dart_ordinal}/3    Saved: {frame_counter}",
+                            (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                cp_y += 30
+
+                # Controls help
+                cv2.putText(cp, "SPACE  manual capture", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+                cp_y += 18
+                cv2.putText(cp, "R  reset round     Q  quit", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+                cp_y += 18
+                cv2.putText(cp, "+/-  adjust threshold", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+
+                cv2.imshow(panel_win, cp)
+
+                # --- Camera display (clean) ---
+                warmup_left = video.warmup_remaining if video else 0
+                if warmup_left > 0:
+                    cv2.putText(display, f"WARMING UP... {warmup_left:.1f}s",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+                elif video and video.is_suppressed:
+                    cv2.putText(display, f"PULL DARTS  |  Dart: {_dart_ordinal}/3",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 2)
+                elif pre_capture_active:
+                    elapsed = time.monotonic() - pre_capture_start
+                    remaining = max(0, settle_delay - elapsed)
+                    cv2.putText(display, f"DART! Settling... {remaining:.1f}s",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+                elif settle_active:
+                    cv2.putText(display, f"COOLDOWN  |  Dart: {_dart_ordinal}/3",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+                else:
+                    cv2.putText(display, f"LIVE  |  Saved: {frame_counter}  |  Dart: {_dart_ordinal}/3",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                # Minimal bottom status on camera view
+                cv2.putText(display, f"Saved: {frame_counter}  |  Dart: {_dart_ordinal}/3",
+                            (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
                 cv2.imshow(win, display)
 
-                should_capture = audio_fired
+                # Start pre-capture delay on trigger
+                if (audio_fired or video_fired) and not pre_capture_active:
+                    pre_capture_active = True
+                    pre_capture_start = time.monotonic()
+                    pre_capture_source = "AUDIO" if audio_fired else "VIDEO"
+                    print(f"\n  [{pre_capture_source}] Dart detected — waiting {settle_delay}s...")
+
+                # Check if pre-capture delay is done → freeze NOW
+                should_capture = False
+                if pre_capture_active and time.monotonic() - pre_capture_start >= settle_delay:
+                    should_capture = True
+                    pre_capture_active = False
+
+                # Check if post-capture settle is done
+                if settle_active and time.monotonic() - settle_start_time >= settle_delay:
+                    settle_active = False
 
                 key = cv2.waitKey(30) & 0xFF
                 if key == ord('q'):
                     break
                 elif key == ord(' '):
                     should_capture = True
+                    pre_capture_active = False
+                    pre_capture_source = ""
                 elif key == ord('r'):
                     _dart_ordinal = 1
                     print("Round reset — dart 1")
@@ -298,10 +574,16 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     if audio:
                         audio.prob_threshold = min(audio.prob_threshold + 0.05, 0.99)
                         print(f"  Dart prob threshold: {audio.prob_threshold:.2f}")
+                    elif video:
+                        video.threshold = min(video.threshold + 2, 200)
+                        print(f"  Video cell threshold: {video.threshold}")
                 elif key == ord('-'):
                     if audio:
                         audio.prob_threshold = max(audio.prob_threshold - 0.05, 0.1)
                         print(f"  Dart prob threshold: {audio.prob_threshold:.2f}")
+                    elif video:
+                        video.threshold = max(video.threshold - 2, 1)
+                        print(f"  Video cell threshold: {video.threshold}")
 
                 if should_capture:
                     frozen_frame = frame.copy()
@@ -310,14 +592,50 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     _text_input = ""
                     _guess_segment = ""
                     _active = True
-                    trigger_src = "AUDIO" if audio_fired else "MANUAL"
-                    print(f"\n[{trigger_src}] Frame captured — annotating dart {_dart_ordinal}")
+                    trigger_label = pre_capture_source if pre_capture_source else "MANUAL"
+                    print(f"[{trigger_label}] Frame captured — annotating dart {_dart_ordinal}")
                     print(f"  Click tip, type segment (e.g. t20, s5, dbull), press ENTER to confirm")
+                    pre_capture_source = ""
 
             else:
                 # Frozen: annotating
                 display = frozen_frame.copy()
                 h, w = display.shape[:2]
+
+                # Update control panel while frozen
+                cp_w, cp_h = 400, 350
+                cp = np.zeros((cp_h, cp_w, 3), dtype=np.uint8)
+                cp[:] = (30, 30, 30)
+                cp_y = 15
+                cv2.putText(cp, "ANNOTATING", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cp_y += 35
+                cv2.putText(cp, f"Dart: {_dart_ordinal}/3    Saved: {frame_counter}",
+                            (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                cp_y += 25
+                cv2.putText(cp, f"Annotated: {len(_annotations)}",
+                            (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                cp_y += 35
+                if _click_point is not None:
+                    if _guess_segment and _text_input == _guess_segment.lower():
+                        cv2.putText(cp, f"Guess: [{_guess_segment}]", (10, cp_y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        cp_y += 22
+                        cv2.putText(cp, "ENTER=accept  or type correction", (10, cp_y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+                    else:
+                        cv2.putText(cp, f"Input: {_text_input}_", (10, cp_y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                        cp_y += 22
+                        cv2.putText(cp, "Type segment (t20, s5, dbull) + ENTER", (10, cp_y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+                else:
+                    cv2.putText(cp, "Click a dart tip", (10, cp_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+                cp_y += 30
+                cv2.putText(cp, "ENTER=save  ESC=discard  Z=undo  R=reset", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+                cv2.imshow(panel_win, cp)
 
                 # Draw existing annotations
                 colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
@@ -443,9 +761,23 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                         frame_counter += 1
                         print(f"  Saved: {fname} with {len(_annotations)} dart(s)")
 
+                        # Update video trigger background so it sees next dart as new
+                        if video:
+                            video.absorb(frozen_frame)
+
+                        # After 3rd dart, suppress trigger for dart removal
+                        if _dart_ordinal >= 3:
+                            if video:
+                                video.suppress_next("Pull darts — trigger suppressed")
+                            _dart_ordinal = 1
+                            print("  Round complete — pull darts (trigger suppressed)")
+
                         frozen_frame = None
                         _active = False
                         _annotations = []
+                        # Start post-capture settle
+                        settle_active = True
+                        settle_start_time = time.monotonic()
 
                     elif key == 27:  # ESC — discard
                         print("  Discarded")
@@ -455,6 +787,9 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                         _click_point = None
                         _text_input = ""
                         _guess_segment = ""
+                        # Start settle on discard too
+                        settle_active = True
+                        settle_start_time = time.monotonic()
 
                     elif key in (ord('z'),) and _annotations:
                         removed = _annotations.pop()
@@ -471,6 +806,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                         print("  Round reset — dart 1")
 
     finally:
+        save_window_sizes([win, panel_win])
         if audio:
             audio.stop()
         cap.release()
@@ -490,19 +826,26 @@ if __name__ == "__main__":
                         help="Skip lens undistortion")
     parser.add_argument("--box-size", type=int, default=30,
                         help="Bounding box size in pixels (default: 30)")
-    parser.add_argument("--no-audio", action="store_true",
-                        help="Disable audio trigger, use SPACE only")
+    parser.add_argument("--trigger", choices=["audio", "video", "manual"],
+                        default="audio",
+                        help="Trigger mode: audio (ML dart sound), video (frame diff), manual (SPACE only)")
     parser.add_argument("--audio-device", type=int, default=None,
                         help="Audio input device index (default: auto-detect eMeet)")
     parser.add_argument("--audio-threshold", type=float, default=0.7,
-                        help="Dart probability threshold for trigger (default: 0.7)")
+                        help="Dart probability threshold for audio trigger (default: 0.7)")
+    parser.add_argument("--video-threshold", type=float, default=5.0,
+                        help="Mean pixel diff threshold for video trigger (default: 5.0)")
+    parser.add_argument("--settle-delay", type=float, default=0.7,
+                        help="Seconds to wait after trigger before freezing (default: 0.7)")
     args = parser.parse_args()
 
     collect_data(
         args.outdir,
         use_undistort=not args.no_undistort,
         box_size=args.box_size,
-        use_audio=not args.no_audio,
+        trigger_mode=args.trigger,
         audio_device=args.audio_device,
         audio_threshold=args.audio_threshold,
+        video_threshold=args.video_threshold,
+        settle_delay=args.settle_delay,
     )
