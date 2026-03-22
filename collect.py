@@ -49,7 +49,8 @@ class UIState(Enum):
     LISTENING = auto()    # waiting for first dart of round
     COLLECTING = auto()   # capturing darts (up to 3), waiting for next or timeout
     SETTLING = auto()     # dart detected, waiting for frame to settle
-    ANNOTATING = auto()   # frozen on a frame, user annotating
+    ANNOTATING = auto()   # frozen on a frame, user clicking tips
+    REVIEW = auto()       # all tips clicked, showing labels, wait for pull or X to edit
     PULL_DARTS = auto()   # round done, suppress until board stable
     PAUSED = auto()       # collection paused, live feed still shows
 
@@ -166,17 +167,30 @@ class AnnotationSession:
         self.click_point = None
         self.text_input = ""
         self.guess_segment = ""
+        self.last_auto_msg = ""
         self._carry_count = len(previous_annotations or [])
 
     def handle_click(self, x, y):
-        self.click_point = (x, y)
+        """Process a click. Auto-confirms if homography provides a guess."""
         guess = _guess_segment_from_homography(x, y, self.homography, self.crop_offset)
         if guess:
-            self.guess_segment = guess
-            self.text_input = guess.lower()
-        else:
-            self.guess_segment = ""
-            self.text_input = ""
+            # Auto-confirm: add annotation directly, no ENTER needed
+            cls_name = make_class_name(self.dart_ordinal, guess)
+            if cls_name in CLASS_TO_ID:
+                self.annotations.append((x, y, cls_name))
+                info = parse_class_name(cls_name)
+                self.last_auto_msg = f"d{self.dart_ordinal} {guess} — {info['label']}"
+                if self.dart_ordinal < 3:
+                    self.dart_ordinal += 1
+                self.click_point = None
+                self.text_input = ""
+                self.guess_segment = ""
+                return True  # auto-confirmed
+        # No guess or invalid — fall back to manual input
+        self.click_point = (x, y)
+        self.guess_segment = guess or ""
+        self.text_input = (guess.lower() if guess else "")
+        return False  # needs manual input
 
     def confirm_segment(self):
         """Try to confirm current input. Returns (success, message)."""
@@ -348,7 +362,8 @@ def render_control_panel(state, video, audio, session, frame_counter,
         UIState.LISTENING: ("LISTENING — throw dart 1", (0, 255, 0)),
         UIState.SETTLING: (f"DART! Settling {settle_remaining:.1f}s", (0, 200, 255)),
         UIState.COLLECTING: (f"COLLECTING — {len(batch_frames)}/3 captured ({collect_remaining:.0f}s)", (0, 200, 255)),
-        UIState.ANNOTATING: (f"ANNOTATING — frame {batch_index+1}/{len(batch_frames)}", (0, 0, 255)),
+        UIState.ANNOTATING: (f"Click dart tips — {len(session.annotations) - session._carry_count if session else 0}/{len(batch_frames)} done", (0, 0, 255)),
+        UIState.REVIEW: ("DONE — pull darts or X to edit", (0, 255, 0)),
         UIState.PULL_DARTS: ("PULL DARTS — " + ("waiting for pull" if video and not video._saw_pull_disturbance else "stabilizing...") if video else "PULL DARTS", (0, 140, 255)),
         UIState.PAUSED: ("PAUSED — press P to resume", (128, 128, 128)),
     }
@@ -360,8 +375,21 @@ def render_control_panel(state, video, audio, session, frame_counter,
                 (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
     cp_y += 25
 
+    # Show labels prominently in REVIEW
+    if state == UIState.REVIEW and session:
+        for (ax, ay, cls_name) in session.annotations:
+            info = parse_class_name(cls_name)
+            colors_d = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
+            color_d = colors_d.get(info["ordinal"], (255, 255, 255))
+            cv2.putText(cp, f"  d{info['ordinal']}: {info['label']}", (10, cp_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_d, 2)
+            cp_y += 22
+        cp_y += 10
+        cv2.putText(cp, "Pull darts to continue  |  X=edit  |  R=discard", (10, cp_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
+
     # Annotation info
-    if state == UIState.ANNOTATING and session:
+    elif state == UIState.ANNOTATING and session:
         cv2.putText(cp, f"Annotations: {len(session.annotations)}", (10, cp_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         cp_y += 25
@@ -399,6 +427,7 @@ def render_camera_hud(display, state, dart_ordinal, frame_counter, n_annotations
         UIState.SETTLING: (f"DART! Settling {settle_remaining:.1f}s  |  Captured: {batch_count}/3", (0, 200, 255)),
         UIState.COLLECTING: (f"COLLECTING  |  Captured: {batch_count}/3  ({collect_remaining:.0f}s)", (0, 200, 255)),
         UIState.ANNOTATING: (f"ANNOTATE  |  Frame {batch_index+1}/{batch_count}  |  Dart: {dart_ordinal}/3  |  Labels: {n_annotations}", (0, 0, 255)),
+        UIState.REVIEW: (f"LABELED  |  Pull darts or X to edit", (0, 255, 0)),
         UIState.PULL_DARTS: (f"PULL DARTS", (0, 140, 255)),
         UIState.PAUSED: (f"PAUSED  |  Saved: {frame_counter}", (128, 128, 128)),
     }
@@ -447,13 +476,16 @@ def render_annotations(display, session, box_size):
 # ---------------------------------------------------------------------------
 
 _session_ref = [None]
+_auto_confirmed = [False]  # signal that a click auto-confirmed
 
 
 def _mouse_callback(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
         session = _session_ref[0]
         if session is not None:
-            session.handle_click(x, y)
+            was_auto = session.handle_click(x, y)
+            if was_auto:
+                _auto_confirmed[0] = True
 
 
 # ---------------------------------------------------------------------------
@@ -659,8 +691,10 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                         state = UIState.LISTENING
 
             # --- Render ---
-            if state == UIState.ANNOTATING and batch_frames:
-                display = batch_frames[batch_index].copy()
+            if state in (UIState.ANNOTATING, UIState.REVIEW) and batch_frames:
+                # Show last frame (all darts visible) during annotating/review
+                show_idx = min(batch_index, len(batch_frames) - 1)
+                display = batch_frames[show_idx].copy()
             else:
                 display = frame.copy()
 
@@ -671,7 +705,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                               settle_remaining=settle_remaining,
                               collect_remaining=collect_remaining)
 
-            if state == UIState.ANNOTATING and session:
+            if state in (UIState.ANNOTATING, UIState.REVIEW) and session:
                 render_annotations(display, session, box_size)
 
             cv2.imshow(win, display)
@@ -763,22 +797,21 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     print(f"  Video cell threshold: {video.threshold}")
 
             elif state == UIState.ANNOTATING and session:
-                # Helper: save current frame and advance to next
-                def _save_and_advance():
-                    nonlocal frame_counter, previous_annotations, dart_ordinal
-                    nonlocal batch_index, session, state, cooldown_start, batch_frames
+                # Check if a click auto-confirmed
+                if _auto_confirmed[0]:
+                    _auto_confirmed[0] = False
+                    print(f"  {session.last_auto_msg}")
 
+                    # Save current frame immediately
                     h_img, w_img = batch_frames[batch_index].shape[:2]
                     fname = f"frame_{frame_counter:05d}.png"
                     cv2.imwrite(str(img_dir / fname), batch_frames[batch_index])
-
                     label_name = f"frame_{frame_counter:05d}.txt"
                     with open(label_dir / label_name, "w") as lf:
                         for (ax, ay, cls_name) in session.annotations:
                             cls_id = CLASS_TO_ID[cls_name]
                             lf.write(f"{cls_id} {ax/w_img:.6f} {ay/h_img:.6f} "
                                      f"{box_size/w_img:.6f} {box_size/h_img:.6f}\n")
-
                     entry = {
                         "filename": fname,
                         "darts": [{"x": ax, "y": ay, "class": cn}
@@ -788,15 +821,16 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     }
                     with open(annotations_path, "a") as f:
                         f.write(json.dumps(entry) + "\n")
-
                     frame_counter += 1
                     print(f"  Saved: {fname} with {len(session.annotations)} dart(s)")
 
+                    # Carry forward and advance
                     previous_annotations = list(session.annotations)
                     dart_ordinal = session.dart_ordinal
-
                     batch_index += 1
+
                     if batch_index < len(batch_frames):
+                        # Next frame — carry forward, show it
                         session = AnnotationSession(
                             homography=homography,
                             previous_annotations=previous_annotations,
@@ -806,74 +840,81 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                         _session_ref[0] = session
                         print(f"  → Frame {batch_index+1}/{len(batch_frames)} — click dart {dart_ordinal} tip")
                     else:
-                        session = None
-                        _session_ref[0] = None
-                        batch_frames = []
-                        batch_index = 0
-                        if video:
-                            video.reset_calm_counter()
-                            state = UIState.PULL_DARTS
-                            cooldown_start = time.monotonic()
-                            print("  Batch complete — pull darts and throw again")
+                        # All frames done — go to REVIEW
+                        state = UIState.REVIEW
+                        print("  All labeled — pull darts or X to edit")
+
+                if state == UIState.ANNOTATING and session:
+                    # Manual input for clicks without auto-guess
+                    if session.click_point is not None:
+                        if key == 13:  # ENTER — confirm typed segment
+                            ok, msg = session.confirm_segment()
+                            print(f"  {msg}")
+                            if not ok:
+                                print("  Try again (e.g. t20, s5, dbull)")
+                        elif key == 27:
+                            session.cancel_click()
                         else:
-                            state = UIState.LISTENING
+                            session.handle_key(key)
+                    else:
+                        if key == ord('z'):
+                            removed = session.undo()
+                            if removed:
+                                print(f"  Undo: {removed[2]}")
+                        elif key == ord('r'):
                             dart_ordinal = 1
                             previous_annotations = []
-                            print("  Batch complete — throw again")
-
-                if session.click_point is not None:
-                    if key == 13:  # ENTER — confirm segment + auto-save
-                        ok, msg = session.confirm_segment()
-                        print(f"  {msg}")
-                        if ok:
-                            # Auto-save and advance immediately
-                            _save_and_advance()
-                        else:
-                            print("  Try again (e.g. t20, s5, dbull)")
-                    elif key == 27:  # ESC — cancel click
-                        session.cancel_click()
-                    else:
-                        session.handle_key(key)
-                else:
-                    if key == 27:  # ESC — discard this frame
-                        print(f"  Discarded frame {batch_index+1}")
-                        batch_frames.pop(batch_index)
-                        if not batch_frames:
+                            batch_frames = []
+                            batch_index = 0
+                            session = None
+                            _session_ref[0] = None
+                            if video:
+                                video.reset_calm_counter()
+                                state = UIState.PULL_DARTS
+                                cooldown_start = time.monotonic()
+                            else:
+                                state = UIState.LISTENING
+                            print("  Round reset — pull darts")
+                        elif key == 27:  # ESC — discard batch
+                            batch_frames = []
+                            batch_index = 0
                             session = None
                             _session_ref[0] = None
                             state = UIState.LISTENING
-                            print("  All frames discarded — listening")
-                        elif batch_index >= len(batch_frames):
-                            batch_index = len(batch_frames) - 1
-                        # Rebuild session for current frame
-                        if batch_frames and state == UIState.ANNOTATING:
-                            session = AnnotationSession(
-                                homography=homography,
-                                previous_annotations=previous_annotations,
-                                start_ordinal=dart_ordinal,
-                                crop_offset=crop_offset,
-                            )
-                            _session_ref[0] = session
+                            print("  Discarded — listening")
 
-                    elif key == ord('z'):
-                        removed = session.undo()
-                        if removed:
-                            print(f"  Undo: {removed[2]}")
-
-                    elif key == ord('r'):
-                        dart_ordinal = 1
-                        previous_annotations = []
-                        batch_frames = []
-                        batch_index = 0
-                        session = None
-                        _session_ref[0] = None
-                        if video:
-                            video.reset_calm_counter()
-                            state = UIState.PULL_DARTS
-                            cooldown_start = time.monotonic()
-                        else:
-                            state = UIState.LISTENING
-                        print("  Round reset — pull darts")
+            elif state == UIState.REVIEW:
+                # Show last frame with all annotations, wait for pull or X
+                if key == ord('x'):
+                    # Go back to annotating to edit
+                    # Rebuild session on last frame
+                    batch_index = len(batch_frames) - 1 if batch_frames else 0
+                    if batch_frames:
+                        session = AnnotationSession(
+                            homography=homography,
+                            previous_annotations=previous_annotations[:-1] if len(previous_annotations) > 1 else [],
+                            start_ordinal=max(1, dart_ordinal - 1),
+                            crop_offset=crop_offset,
+                        )
+                        _session_ref[0] = session
+                        state = UIState.ANNOTATING
+                        print("  Edit mode — Z to undo, click to re-annotate")
+                elif key == ord('r') or (video and video.saw_disturbance()):
+                    # Accept and move on
+                    dart_ordinal = 1
+                    previous_annotations = []
+                    batch_frames = []
+                    batch_index = 0
+                    session = None
+                    _session_ref[0] = None
+                    if video:
+                        video.reset_calm_counter()
+                        state = UIState.PULL_DARTS
+                        cooldown_start = time.monotonic()
+                        print("  Pull darts...")
+                    else:
+                        state = UIState.LISTENING
+                        print("  Ready for next round")
 
     finally:
         save_window_sizes([win, panel_win])
