@@ -51,6 +51,7 @@ class UIState(Enum):
     SETTLING = auto()     # dart detected, waiting for frame to settle
     ANNOTATING = auto()   # frozen on a frame, user annotating
     PULL_DARTS = auto()   # round done, suppress until board stable
+    PAUSED = auto()       # collection paused, live feed still shows
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +344,7 @@ def render_control_panel(state, video, audio, session, frame_counter,
         UIState.COLLECTING: (f"COLLECTING — {len(batch_frames)}/3 captured ({collect_remaining:.0f}s)", (0, 200, 255)),
         UIState.ANNOTATING: (f"ANNOTATING — frame {batch_index+1}/{len(batch_frames)}", (0, 0, 255)),
         UIState.PULL_DARTS: ("PULL DARTS — " + ("waiting for pull" if video and not video._saw_pull_disturbance else "stabilizing...") if video else "PULL DARTS", (0, 140, 255)),
+        UIState.PAUSED: ("PAUSED — press P to resume", (128, 128, 128)),
     }
     text, color = state_info.get(state, ("", (255, 255, 255)))
     cv2.putText(cp, text, (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
@@ -376,8 +378,8 @@ def render_control_panel(state, video, audio, session, frame_counter,
     cp_y += 25
 
     # Controls
-    cv2.putText(cp, "SPACE=capture  R=reset  +/-=threshold  Q=quit", (10, cp_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
+    cv2.putText(cp, "SPACE=capture  R=reset  P=pause  +/-=threshold  Q=quit", (10, cp_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
 
     return cp
 
@@ -392,6 +394,7 @@ def render_camera_hud(display, state, dart_ordinal, frame_counter, n_annotations
         UIState.COLLECTING: (f"COLLECTING  |  Captured: {batch_count}/3  ({collect_remaining:.0f}s)", (0, 200, 255)),
         UIState.ANNOTATING: (f"ANNOTATE  |  Frame {batch_index+1}/{batch_count}  |  Dart: {dart_ordinal}/3  |  Labels: {n_annotations}", (0, 0, 255)),
         UIState.PULL_DARTS: (f"PULL DARTS", (0, 140, 255)),
+        UIState.PAUSED: (f"PAUSED  |  Saved: {frame_counter}", (128, 128, 128)),
     }
     text, color = labels.get(state, ("", (255, 255, 255)))
     cv2.putText(display, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -517,6 +520,7 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
 
     # --- State ---
     state = UIState.WARMUP if video else UIState.LISTENING
+    paused_from = None  # state to resume to when unpausing
     session = None
     _session_ref[0] = None
     dart_ordinal = 1
@@ -725,6 +729,18 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                 _session_ref[0] = session
                 print(f"  Skipped — annotate {len(batch_frames)} frame(s)")
 
+            elif key == ord('p') and state != UIState.ANNOTATING:
+                if state == UIState.PAUSED:
+                    # Resume
+                    state = paused_from if paused_from else UIState.LISTENING
+                    paused_from = None
+                    print("Resumed")
+                else:
+                    # Pause
+                    paused_from = state
+                    state = UIState.PAUSED
+                    print("Paused — press P to resume")
+
             elif key == ord('+') or key == ord('='):
                 if audio:
                     audio.prob_threshold = min(audio.prob_threshold + 0.05, 0.99)
@@ -871,32 +887,497 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
 
 
 # ---------------------------------------------------------------------------
+# Capture-only mode — just record frames, no labeling
+# ---------------------------------------------------------------------------
+
+def capture_only(outdir="data/training", use_undistort=True,
+                 trigger_mode="video", audio_device=None, audio_threshold=0.7,
+                 video_threshold=5.0, settle_delay=0.7):
+    """Record frames on dart impacts. No annotation, no freezing.
+
+    Just throw darts. Each impact auto-captures a settled frame.
+    Press R between rounds. Images saved without labels for later annotation.
+    """
+    outdir = Path(outdir)
+    img_dir = outdir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    unlabeled_log = outdir / "unlabeled.jsonl"
+
+    # Count existing images to continue numbering
+    existing = len(list(img_dir.glob("*.png")))
+    frame_counter = existing
+
+    from calibrate import open_camera, load_lens_params, undistort_frame, load_crop_roi, apply_crop
+    cap = open_camera()
+
+    lens_params = None
+    if use_undistort and config.LENS_PARAMS_PATH.exists():
+        lens_params = load_lens_params()
+
+    crop_roi = load_crop_roi()
+    crop_offset = (0, 0)
+    if crop_roi is not None:
+        crop_offset = (crop_roi[0], crop_roi[1])
+
+    audio = None
+    video = None
+    if trigger_mode == "audio":
+        audio = DartAudioTrigger(device=audio_device, prob_threshold=audio_threshold)
+        if not audio.start():
+            audio = None
+    elif trigger_mode == "video":
+        video = VideoTrigger(threshold=video_threshold)
+
+    win = "Capture Mode"
+    panel_win = "Control Panel"
+    create_window(win, default_width=960, default_height=540)
+    create_window(panel_win, default_width=400, default_height=250)
+
+    print(f"\n=== CAPTURE-ONLY MODE ===")
+    print(f"Just throw darts. Frames auto-saved on impact.")
+    print(f"R=reset round  P=pause  SPACE=manual  Q=quit")
+    print(f"Starting from frame {frame_counter}\n")
+
+    state = UIState.WARMUP if video else UIState.LISTENING
+    paused_from = None
+    settle_start = 0.0
+    cooldown_start = 0.0
+    darts_this_round = 0
+
+    try:
+        while True:
+            ret, raw = cap.read()
+            if not ret:
+                break
+
+            frame = raw
+            if lens_params is not None:
+                frame = undistort_frame(raw, *lens_params)
+            frame = apply_crop(frame, crop_roi)
+
+            if video:
+                video.update(frame)
+
+            settle_remaining = 0
+
+            # State machine
+            if state == UIState.WARMUP:
+                if (video and video.warmup_remaining <= 0) or not video:
+                    state = UIState.LISTENING
+                    print("Listening...")
+
+            elif state == UIState.LISTENING:
+                triggered = False
+                if audio and audio.check_and_reset():
+                    triggered = True
+                elif video and video.check_trigger():
+                    triggered = True
+                if triggered:
+                    settle_start = time.monotonic()
+                    state = UIState.SETTLING
+                    darts_this_round += 1
+
+            elif state == UIState.SETTLING:
+                elapsed = time.monotonic() - settle_start
+                settle_remaining = max(0, settle_delay - elapsed)
+                if elapsed >= settle_delay:
+                    # Save frame
+                    fname = f"frame_{frame_counter:05d}.png"
+                    cv2.imwrite(str(img_dir / fname), frame)
+                    entry = {
+                        "filename": fname,
+                        "dart_in_round": darts_this_round,
+                        "timestamp": time.time(),
+                    }
+                    with open(unlabeled_log, "a") as f:
+                        f.write(json.dumps(entry) + "\n")
+                    frame_counter += 1
+                    print(f"  Captured: {fname} (dart {darts_this_round}/3)")
+
+                    if video:
+                        video.absorb(frame)
+
+                    if darts_this_round >= 3:
+                        state = UIState.LISTENING  # will wait for R to reset
+                    else:
+                        state = UIState.LISTENING
+
+            elif state == UIState.PULL_DARTS:
+                if video:
+                    if not video._saw_pull_disturbance:
+                        if video.saw_disturbance():
+                            video._saw_pull_disturbance = True
+                            video._suppress_calm_count = 0
+                    else:
+                        if video.is_calm():
+                            state = UIState.LISTENING
+                            print("  Board stable — listening")
+                else:
+                    if time.monotonic() - cooldown_start >= 3.0:
+                        state = UIState.LISTENING
+
+            # Render
+            display = frame.copy()
+            h, w = display.shape[:2]
+
+            # Camera HUD
+            if state == UIState.WARMUP:
+                text = f"WARMING UP... {video.warmup_remaining:.1f}s"
+                color = (100, 100, 100)
+            elif state == UIState.SETTLING:
+                text = f"DART! Settling {settle_remaining:.1f}s"
+                color = (0, 200, 255)
+            elif state == UIState.PULL_DARTS:
+                text = "PULL DARTS"
+                color = (0, 140, 255)
+            elif state == UIState.PAUSED:
+                text = "PAUSED"
+                color = (128, 128, 128)
+            else:
+                text = f"LIVE  |  Saved: {frame_counter}  |  Round dart: {darts_this_round}/3"
+                color = (0, 255, 0)
+            cv2.putText(display, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.imshow(win, display)
+
+            # Control panel
+            cp_w, cp_h = 400, 250
+            cp = np.zeros((cp_h, cp_w, 3), dtype=np.uint8)
+            cp[:] = (30, 30, 30)
+            cp_y = 20
+            cv2.putText(cp, "CAPTURE-ONLY MODE", (10, cp_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            cp_y += 30
+            if video:
+                wave_x, wave_w, wave_h = 10, cp_w - 20, 70
+                _draw_waveform(cp, wave_x, cp_y, wave_w, wave_h,
+                               video._diff_history, video.threshold, video._history_max)
+                cp_y += wave_h + 15
+                cv2.putText(cp, f"cells={video.current_diff:.0f}  thresh={video.threshold}",
+                            (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+                cp_y += 22
+            cv2.putText(cp, f"Saved: {frame_counter}  |  Round: {darts_this_round}/3",
+                        (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+            cp_y += 30
+            cv2.putText(cp, "R=reset  P=pause  SPACE=manual  +/-=thresh  Q=quit",
+                        (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+            cv2.imshow(panel_win, cp)
+
+            # Keys
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                darts_this_round = 0
+                if video:
+                    video.reset_calm_counter()
+                    state = UIState.PULL_DARTS
+                    cooldown_start = time.monotonic()
+                    print("Round reset — pull darts")
+                else:
+                    print("Round reset")
+            elif key == ord(' ') and state in (UIState.LISTENING, UIState.PAUSED):
+                fname = f"frame_{frame_counter:05d}.png"
+                cv2.imwrite(str(img_dir / fname), frame)
+                darts_this_round += 1
+                entry = {"filename": fname, "dart_in_round": darts_this_round, "timestamp": time.time()}
+                with open(unlabeled_log, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+                frame_counter += 1
+                if video:
+                    video.absorb(frame)
+                print(f"  [MANUAL] {fname} (dart {darts_this_round}/3)")
+            elif key == ord('p'):
+                if state == UIState.PAUSED:
+                    state = paused_from or UIState.LISTENING
+                    paused_from = None
+                    print("Resumed")
+                else:
+                    paused_from = state
+                    state = UIState.PAUSED
+                    print("Paused")
+            elif key == ord('+') or key == ord('='):
+                if video:
+                    video.threshold = min(video.threshold + 2, 200)
+                    print(f"  Threshold: {video.threshold}")
+                elif audio:
+                    audio.prob_threshold = min(audio.prob_threshold + 0.05, 0.99)
+            elif key == ord('-'):
+                if video:
+                    video.threshold = max(video.threshold - 2, 1)
+                    print(f"  Threshold: {video.threshold}")
+                elif audio:
+                    audio.prob_threshold = max(audio.prob_threshold - 0.05, 0.1)
+
+    finally:
+        save_window_sizes([win, panel_win])
+        if audio:
+            audio.stop()
+        cap.release()
+        cv2.destroyAllWindows()
+        print(f"\nDone. {frame_counter} frames saved to {img_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Label mode — annotate unlabeled frames offline
+# ---------------------------------------------------------------------------
+
+def label_offline(outdir="data/training", box_size=30):
+    """Browse and label previously captured frames.
+
+    Shows each unlabeled image, lets you click dart tips and type labels.
+    Skips frames that already have label files.
+    """
+    outdir = Path(outdir)
+    img_dir = outdir / "images"
+    label_dir = outdir / "labels"
+    label_dir.mkdir(parents=True, exist_ok=True)
+    annotations_path = outdir / "annotations.jsonl"
+
+    # Find unlabeled images (have .png but no matching .txt in labels/)
+    all_images = sorted(img_dir.glob("*.png"))
+    unlabeled = [p for p in all_images if not (label_dir / (p.stem + ".txt")).exists()]
+
+    if not unlabeled:
+        print("No unlabeled images found.")
+        return
+
+    print(f"\n=== LABEL MODE ===")
+    print(f"Found {len(unlabeled)} unlabeled frames out of {len(all_images)} total")
+    print(f"Controls: Click=tip  type label+ENTER  ENTER=save  ESC=skip  Z=undo  Q=quit\n")
+
+    # Load homography for guessing
+    homography = None
+    if config.BOARD_HOMOGRAPHY_PATH.exists():
+        hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH))
+        homography = hom_data['homography']
+        print("Board homography loaded — segment guess enabled")
+
+    crop_roi_data = None
+    crop_offset = (0, 0)
+    if config.CROP_ROI_PATH.exists():
+        crop_roi_data = np.load(str(config.CROP_ROI_PATH))
+        roi = crop_roi_data["crop_roi"]
+        crop_offset = (int(roi[0]), int(roi[1]))
+
+    win = "Label Frames"
+    panel_win = "Control Panel"
+    create_window(win, default_width=960, default_height=540)
+    create_window(panel_win, default_width=400, default_height=300)
+
+    session = None
+    _session_ref[0] = None
+    cv2.setMouseCallback(win, _mouse_callback)
+
+    img_index = 0
+    dart_ordinal = 1
+    previous_annotations = []
+    labeled_count = 0
+
+    # Group images into rounds by looking at unlabeled.jsonl dart_in_round
+    # or just let the user manage ordinals with R
+    round_frame = 0  # which frame in the current round (0, 1, 2)
+
+    while img_index < len(unlabeled):
+        img_path = unlabeled[img_index]
+        frame = cv2.imread(str(img_path))
+        if frame is None:
+            img_index += 1
+            continue
+
+        if session is None:
+            session = AnnotationSession(
+                homography=homography,
+                previous_annotations=previous_annotations,
+                start_ordinal=dart_ordinal,
+                crop_offset=crop_offset,
+            )
+            _session_ref[0] = session
+
+        # Render
+        display = frame.copy()
+        h, w = display.shape[:2]
+
+        render_annotations(display, session, box_size)
+
+        cv2.putText(display, f"{img_path.name}  |  {img_index+1}/{len(unlabeled)}  |  Dart: {dart_ordinal}/3",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(display, f"Labeled: {labeled_count}  |  Remaining: {len(unlabeled) - img_index}",
+                    (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        cv2.imshow(win, display)
+
+        # Control panel
+        cp_w, cp_h = 400, 300
+        cp = np.zeros((cp_h, cp_w, 3), dtype=np.uint8)
+        cp[:] = (30, 30, 30)
+        cp_y = 20
+        cv2.putText(cp, "LABEL MODE", (10, cp_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cp_y += 30
+        cv2.putText(cp, f"File: {img_path.name}", (10, cp_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        cp_y += 22
+        cv2.putText(cp, f"Frame {img_index+1}/{len(unlabeled)}  |  Dart: {dart_ordinal}/3",
+                    (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cp_y += 22
+        cv2.putText(cp, f"Annotations: {len(session.annotations)}",
+                    (10, cp_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cp_y += 30
+        if session.click_point is not None:
+            if session.guess_segment and session.text_input == session.guess_segment.lower():
+                cv2.putText(cp, f"Guess: [{session.guess_segment}]", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cp_y += 20
+                cv2.putText(cp, "ENTER=accept  or type correction", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+            else:
+                cv2.putText(cp, f"Input: {session.text_input}_", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                cp_y += 20
+                cv2.putText(cp, "Type segment + ENTER", (10, cp_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+        else:
+            cv2.putText(cp, "Click a dart tip", (10, cp_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        cp_y += 30
+        cv2.putText(cp, "ENTER=save  ESC=skip  Z=undo  R=reset round  Q=quit", (10, cp_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+        cv2.imshow(panel_win, cp)
+
+        key = cv2.waitKey(30) & 0xFF
+
+        if key == ord('q'):
+            break
+
+        elif session.click_point is not None:
+            if key == 13:
+                ok, msg = session.confirm_segment()
+                print(f"  {msg}")
+                if not ok:
+                    print("  Try again")
+            elif key == 27:
+                session.cancel_click()
+            else:
+                session.handle_key(key)
+        else:
+            if key == 13:  # ENTER — save
+                if not session.annotations:
+                    print("  No annotations — click tips first, ESC to skip")
+                    continue
+
+                label_name = img_path.stem + ".txt"
+                with open(label_dir / label_name, "w") as lf:
+                    for (ax, ay, cls_name) in session.annotations:
+                        cls_id = CLASS_TO_ID[cls_name]
+                        lf.write(f"{cls_id} {ax/w:.6f} {ay/h:.6f} "
+                                 f"{box_size/w:.6f} {box_size/h:.6f}\n")
+
+                entry = {
+                    "filename": img_path.name,
+                    "darts": [{"x": ax, "y": ay, "class": cn}
+                              for (ax, ay, cn) in session.annotations],
+                    "n_darts": len(session.annotations),
+                    "timestamp": time.time(),
+                }
+                with open(annotations_path, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+
+                labeled_count += 1
+                print(f"  Saved: {label_name} with {len(session.annotations)} dart(s)")
+
+                previous_annotations = list(session.annotations)
+                dart_ordinal = session.dart_ordinal
+                session = None
+                _session_ref[0] = None
+                img_index += 1
+                round_frame += 1
+
+            elif key == 27:  # ESC — skip
+                print(f"  Skipped {img_path.name}")
+                session = None
+                _session_ref[0] = None
+                img_index += 1
+
+            elif key == ord('z'):
+                removed = session.undo()
+                if removed:
+                    print(f"  Undo: {removed[2]}")
+
+            elif key == ord('r'):
+                dart_ordinal = 1
+                previous_annotations = []
+                round_frame = 0
+                session = None
+                _session_ref[0] = None
+                print("  Round reset — dart 1")
+
+    save_window_sizes([win, panel_win])
+    cv2.destroyAllWindows()
+    print(f"\nDone. Labeled {labeled_count} frames.")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect YOLO dart training data")
-    parser.add_argument("--outdir", default="data/training")
-    parser.add_argument("--no-undistort", action="store_true")
-    parser.add_argument("--box-size", type=int, default=30)
-    parser.add_argument("--trigger", choices=["audio", "video", "manual"], default="audio")
-    parser.add_argument("--audio-device", type=int, default=None)
-    parser.add_argument("--audio-threshold", type=float, default=0.7)
-    parser.add_argument("--video-threshold", type=float, default=5.0)
-    parser.add_argument("--settle-delay", type=float, default=0.7,
-                        help="Seconds to wait after trigger before capture (default: 0.7)")
-    parser.add_argument("--collect-timeout", type=float, default=10.0,
-                        help="Seconds to wait for more darts after first capture (default: 10)")
+    sub = parser.add_subparsers(dest="mode", help="Mode")
+
+    # Default: full batch collection (capture + annotate)
+    p_collect = sub.add_parser("collect", help="Batch capture + annotate (default)")
+    p_collect.add_argument("--outdir", default="data/training")
+    p_collect.add_argument("--no-undistort", action="store_true")
+    p_collect.add_argument("--box-size", type=int, default=30)
+    p_collect.add_argument("--trigger", choices=["audio", "video", "manual"], default="audio")
+    p_collect.add_argument("--audio-device", type=int, default=None)
+    p_collect.add_argument("--audio-threshold", type=float, default=0.7)
+    p_collect.add_argument("--video-threshold", type=float, default=5.0)
+    p_collect.add_argument("--settle-delay", type=float, default=0.7)
+    p_collect.add_argument("--collect-timeout", type=float, default=10.0)
+
+    # Capture-only: just record frames
+    p_capture = sub.add_parser("capture", help="Capture frames only, no labeling")
+    p_capture.add_argument("--outdir", default="data/training")
+    p_capture.add_argument("--no-undistort", action="store_true")
+    p_capture.add_argument("--trigger", choices=["audio", "video", "manual"], default="video")
+    p_capture.add_argument("--audio-device", type=int, default=None)
+    p_capture.add_argument("--audio-threshold", type=float, default=0.7)
+    p_capture.add_argument("--video-threshold", type=float, default=5.0)
+    p_capture.add_argument("--settle-delay", type=float, default=0.7)
+
+    # Label: annotate unlabeled frames offline
+    p_label = sub.add_parser("label", help="Label previously captured frames")
+    p_label.add_argument("--outdir", default="data/training")
+    p_label.add_argument("--box-size", type=int, default=30)
+
     args = parser.parse_args()
 
-    collect_data(
-        args.outdir,
-        use_undistort=not args.no_undistort,
-        box_size=args.box_size,
-        trigger_mode=args.trigger,
-        audio_device=args.audio_device,
-        audio_threshold=args.audio_threshold,
-        video_threshold=args.video_threshold,
-        settle_delay=args.settle_delay,
-        collect_timeout=args.collect_timeout,
-    )
+    if args.mode == "capture":
+        capture_only(
+            args.outdir,
+            use_undistort=not args.no_undistort,
+            trigger_mode=args.trigger,
+            audio_device=args.audio_device,
+            audio_threshold=args.audio_threshold,
+            video_threshold=args.video_threshold,
+            settle_delay=args.settle_delay,
+        )
+    elif args.mode == "label":
+        label_offline(args.outdir, box_size=args.box_size)
+    else:
+        # Default to collect if no subcommand or "collect"
+        if not hasattr(args, 'outdir'):
+            # No subcommand given — run collect with defaults
+            collect_data()
+        else:
+            collect_data(
+                args.outdir,
+                use_undistort=not args.no_undistort,
+                box_size=args.box_size,
+                trigger_mode=args.trigger,
+                audio_device=args.audio_device,
+                audio_threshold=args.audio_threshold,
+                video_threshold=args.video_threshold,
+                settle_delay=args.settle_delay,
+                collect_timeout=args.collect_timeout,
+            )
