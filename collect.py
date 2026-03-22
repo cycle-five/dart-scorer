@@ -763,80 +763,79 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                     print(f"  Video cell threshold: {video.threshold}")
 
             elif state == UIState.ANNOTATING and session:
+                # Helper: save current frame and advance to next
+                def _save_and_advance():
+                    nonlocal frame_counter, previous_annotations, dart_ordinal
+                    nonlocal batch_index, session, state, cooldown_start, batch_frames
+
+                    h_img, w_img = batch_frames[batch_index].shape[:2]
+                    fname = f"frame_{frame_counter:05d}.png"
+                    cv2.imwrite(str(img_dir / fname), batch_frames[batch_index])
+
+                    label_name = f"frame_{frame_counter:05d}.txt"
+                    with open(label_dir / label_name, "w") as lf:
+                        for (ax, ay, cls_name) in session.annotations:
+                            cls_id = CLASS_TO_ID[cls_name]
+                            lf.write(f"{cls_id} {ax/w_img:.6f} {ay/h_img:.6f} "
+                                     f"{box_size/w_img:.6f} {box_size/h_img:.6f}\n")
+
+                    entry = {
+                        "filename": fname,
+                        "darts": [{"x": ax, "y": ay, "class": cn}
+                                  for (ax, ay, cn) in session.annotations],
+                        "n_darts": len(session.annotations),
+                        "timestamp": time.time(),
+                    }
+                    with open(annotations_path, "a") as f:
+                        f.write(json.dumps(entry) + "\n")
+
+                    frame_counter += 1
+                    print(f"  Saved: {fname} with {len(session.annotations)} dart(s)")
+
+                    previous_annotations = list(session.annotations)
+                    dart_ordinal = session.dart_ordinal
+
+                    batch_index += 1
+                    if batch_index < len(batch_frames):
+                        session = AnnotationSession(
+                            homography=homography,
+                            previous_annotations=previous_annotations,
+                            start_ordinal=dart_ordinal,
+                            crop_offset=crop_offset,
+                        )
+                        _session_ref[0] = session
+                        print(f"  → Frame {batch_index+1}/{len(batch_frames)} — click dart {dart_ordinal} tip")
+                    else:
+                        session = None
+                        _session_ref[0] = None
+                        batch_frames = []
+                        batch_index = 0
+                        if video:
+                            video.reset_calm_counter()
+                            state = UIState.PULL_DARTS
+                            cooldown_start = time.monotonic()
+                            print("  Batch complete — pull darts and throw again")
+                        else:
+                            state = UIState.LISTENING
+                            dart_ordinal = 1
+                            previous_annotations = []
+                            print("  Batch complete — throw again")
+
                 if session.click_point is not None:
-                    if key == 13:  # ENTER — confirm segment
+                    if key == 13:  # ENTER — confirm segment + auto-save
                         ok, msg = session.confirm_segment()
                         print(f"  {msg}")
-                        if not ok:
+                        if ok:
+                            # Auto-save and advance immediately
+                            _save_and_advance()
+                        else:
                             print("  Try again (e.g. t20, s5, dbull)")
                     elif key == 27:  # ESC — cancel click
                         session.cancel_click()
                     else:
                         session.handle_key(key)
                 else:
-                    if key == 13:  # ENTER — save this frame and advance
-                        if not session.annotations:
-                            print("  No annotations — click tips first")
-                            continue
-
-                        # Save image + labels
-                        h_img, w_img = batch_frames[batch_index].shape[:2]
-                        fname = f"frame_{frame_counter:05d}.png"
-                        cv2.imwrite(str(img_dir / fname), batch_frames[batch_index])
-
-                        label_name = f"frame_{frame_counter:05d}.txt"
-                        with open(label_dir / label_name, "w") as lf:
-                            for (ax, ay, cls_name) in session.annotations:
-                                cls_id = CLASS_TO_ID[cls_name]
-                                lf.write(f"{cls_id} {ax/w_img:.6f} {ay/h_img:.6f} "
-                                         f"{box_size/w_img:.6f} {box_size/h_img:.6f}\n")
-
-                        entry = {
-                            "filename": fname,
-                            "darts": [{"x": ax, "y": ay, "class": cn}
-                                      for (ax, ay, cn) in session.annotations],
-                            "n_darts": len(session.annotations),
-                            "timestamp": time.time(),
-                        }
-                        with open(annotations_path, "a") as f:
-                            f.write(json.dumps(entry) + "\n")
-
-                        frame_counter += 1
-                        print(f"  Saved: {fname} with {len(session.annotations)} dart(s)")
-
-                        # Carry forward for next frame in batch
-                        previous_annotations = list(session.annotations)
-                        dart_ordinal = session.dart_ordinal
-
-                        # Advance to next frame in batch
-                        batch_index += 1
-                        if batch_index < len(batch_frames):
-                            session = AnnotationSession(
-                                homography=homography,
-                                previous_annotations=previous_annotations,
-                                start_ordinal=dart_ordinal,
-                                crop_offset=crop_offset,
-                            )
-                            _session_ref[0] = session
-                            print(f"  Annotate frame {batch_index+1}/{len(batch_frames)}")
-                        else:
-                            # Batch complete
-                            session = None
-                            _session_ref[0] = None
-                            batch_frames = []
-                            batch_index = 0
-                            if video:
-                                video.reset_calm_counter()
-                                state = UIState.PULL_DARTS
-                                cooldown_start = time.monotonic()
-                                print("  Batch complete — pull darts")
-                            else:
-                                state = UIState.LISTENING
-                                dart_ordinal = 1
-                                previous_annotations = []
-                                print("  Batch complete — ready for next round")
-
-                    elif key == 27:  # ESC — discard this frame
+                    if key == 27:  # ESC — discard this frame
                         print(f"  Discarded frame {batch_index+1}")
                         batch_frames.pop(batch_index)
                         if not batch_frames:
@@ -846,14 +845,8 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
                             print("  All frames discarded — listening")
                         elif batch_index >= len(batch_frames):
                             batch_index = len(batch_frames) - 1
-                            session = AnnotationSession(
-                                homography=homography,
-                                previous_annotations=previous_annotations,
-                                start_ordinal=dart_ordinal,
-                                crop_offset=crop_offset,
-                            )
-                            _session_ref[0] = session
-                        else:
+                        # Rebuild session for current frame
+                        if batch_frames and state == UIState.ANNOTATING:
                             session = AnnotationSession(
                                 homography=homography,
                                 previous_annotations=previous_annotations,
