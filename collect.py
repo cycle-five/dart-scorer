@@ -269,6 +269,8 @@ def _guess_segment_from_homography(x, y, homography, crop_offset=(0, 0)):
             return f"T{sector}"
         elif config.DOUBLE_INNER_RADIUS - 5 < r < config.DOUBLE_OUTER_RADIUS + 10:
             return f"D{sector}"
+        elif r > config.DOUBLE_OUTER_RADIUS + 10:
+            return "MISS"
         else:
             return f"S{sector}"
     except Exception:

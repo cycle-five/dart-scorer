@@ -1,17 +1,18 @@
 """
-classes.py — YOLO class definitions for 186-class dart detection.
+classes.py — YOLO class definitions for 189-class dart detection.
 
 Classes encode dart ordinal (1st, 2nd, 3rd) and board segment.
 Format: d{ordinal}_{segment}
 
-Segments (62 total):
+Segments (63 total):
   S1..S20   — single 1-20
   D1..D20   — double 1-20
   T1..T20   — triple 1-20
   S_BULL    — single bull (25)
   D_BULL    — double bull (50)
+  MISS      — outside scoring area (0 points)
 
-Total: 3 ordinals × 62 segments = 186 classes.
+Total: 3 ordinals × 63 segments = 189 classes.
 """
 
 SECTORS = list(range(1, 21))
@@ -19,12 +20,13 @@ RINGS = ["S", "D", "T"]  # single, double, triple
 BULLS = ["S_BULL", "D_BULL"]
 ORDINALS = [1, 2, 3]
 
-# Build segment list (62 segments)
+# Build segment list (63 segments)
 SEGMENTS = []
 for s in SECTORS:
     for r in RINGS:
         SEGMENTS.append(f"{r}{s}")
 SEGMENTS.extend(BULLS)
+SEGMENTS.append("MISS")
 
 # Build full class list (186 classes)
 CLASS_NAMES = []
@@ -49,7 +51,17 @@ def parse_class_name(name):
     ordinal = int(parts[0][1])  # d1 -> 1
     segment = parts[1]
 
-    if segment == "S_BULL":
+    if segment == "MISS":
+        return {
+            "ordinal": ordinal,
+            "segment": segment,
+            "sector": 0,
+            "ring": "miss",
+            "multiplier": 0,
+            "score": 0,
+            "label": "Miss → 0",
+        }
+    elif segment == "S_BULL":
         return {
             "ordinal": ordinal,
             "segment": segment,
@@ -100,6 +112,8 @@ def segment_shorthand(text):
     """
     text = text.strip().upper()
 
+    if text in ("MISS", "M", "OUT"):
+        return "MISS"
     if text in ("DBULL", "DB"):
         return "D_BULL"
     if text in ("SBULL", "SB", "BULL"):
