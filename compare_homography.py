@@ -31,6 +31,78 @@ from classes import ID_TO_CLASS, parse_class_name
 from window_manager import create_window, save_window_sizes
 
 
+def _draw_homography_overlay(display, homography, crop_offset=(0, 0), alpha=0.4):
+    """Draw the board geometry overlay on camera image using inverse homography.
+
+    Transforms ring circles, sector lines, and number labels from canonical
+    board space back to camera pixel space so you can see where the homography
+    thinks each segment is.
+    """
+    import math
+
+    H_inv = np.linalg.inv(homography)
+    cx, cy = config.CANONICAL_CENTER
+    ox, oy = crop_offset
+
+    def canon_to_cam(px, py):
+        """Transform canonical board coords to cropped camera coords."""
+        pts = np.array([[[px, py]]], dtype=np.float32)
+        transformed = cv2.perspectiveTransform(pts, H_inv)
+        cam_x = float(transformed[0][0][0]) - ox
+        cam_y = float(transformed[0][0][1]) - oy
+        return int(round(cam_x)), int(round(cam_y))
+
+    # Draw ring circles as polygons (circles warp to ellipses under perspective)
+    ring_defs = [
+        (config.INNER_BULL_RADIUS,   (0, 255, 0),   1),
+        (config.OUTER_BULL_RADIUS,   (0, 255, 0),   1),
+        (config.TRIPLE_INNER_RADIUS, (0, 150, 255), 1),
+        (config.TRIPLE_OUTER_RADIUS, (0, 150, 255), 1),
+        (config.DOUBLE_INNER_RADIUS, (0, 0, 255),   1),
+        (config.DOUBLE_OUTER_RADIUS, (0, 0, 255),   2),
+    ]
+
+    for radius, color, thickness in ring_defs:
+        pts = []
+        for deg in range(0, 360, 3):
+            rad = math.radians(deg)
+            bx = cx + radius * math.sin(rad)
+            by = cy - radius * math.cos(rad)
+            pts.append(canon_to_cam(bx, by))
+        pts = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(display, [pts], isClosed=True, color=color, thickness=thickness)
+
+    # Sector dividing lines
+    for i in range(20):
+        boundary_deg = (i * 18 - 9) % 360
+        rad = math.radians(boundary_deg)
+        # Line from bull to outer double
+        inner_r = config.OUTER_BULL_RADIUS
+        outer_r = config.DOUBLE_OUTER_RADIUS
+        ix = cx + inner_r * math.sin(rad)
+        iy = cy - inner_r * math.cos(rad)
+        ex = cx + outer_r * math.sin(rad)
+        ey = cy - outer_r * math.cos(rad)
+        p1 = canon_to_cam(ix, iy)
+        p2 = canon_to_cam(ex, ey)
+        cv2.line(display, p1, p2, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # Sector number labels
+    label_r = config.DOUBLE_OUTER_RADIUS + 12
+    for i, sector_num in enumerate(config.SECTOR_ORDER):
+        angle_deg = i * 18
+        rad = math.radians(angle_deg)
+        lx = cx + label_r * math.sin(rad)
+        ly = cy - label_r * math.cos(rad)
+        pt = canon_to_cam(lx, ly)
+        cv2.putText(display, str(sector_num), (pt[0] - 8, pt[1] + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+    # Bullseye center marker
+    center = canon_to_cam(cx, cy)
+    cv2.drawMarker(display, center, (0, 255, 0), cv2.MARKER_CROSS, 15, 2)
+
+
 def _homography_predict(x, y, homography, crop_offset=(0, 0)):
     """Predict segment from pixel coords using homography.
 
@@ -190,7 +262,7 @@ def print_report(comparisons):
         print(f"  {pred:>10s} → {actual:<10s}  ({count}x)")
 
 
-def browse_comparisons(comparisons, labeled_data):
+def browse_comparisons(comparisons, labeled_data, homography=None, crop_offset=(0, 0)):
     """Interactive browser to view each dart comparison on the image."""
     if not comparisons:
         print("No comparisons to browse.")
@@ -213,11 +285,12 @@ def browse_comparisons(comparisons, labeled_data):
     SHOW_MISSES = 1
     show_mode = SHOW_ALL
     mode_names = ["ALL", "MISSES ONLY"]
+    show_overlay = True  # board geometry overlay
 
     file_idx = 0
-    dart_idx = 0  # which dart within the file to highlight
+    dart_idx = 0
 
-    print("\nBrowse: LEFT/RIGHT=file  UP/DOWN=dart  M=toggle misses-only  Q=quit\n")
+    print("\nBrowse: LEFT/RIGHT=file  UP/DOWN=dart  M=misses  O=overlay  Q=quit\n")
 
     def get_filtered_files():
         if show_mode == SHOW_MISSES:
@@ -253,6 +326,10 @@ def browse_comparisons(comparisons, labeled_data):
 
         display = img.copy()
         h, w = display.shape[:2]
+
+        # Draw board geometry overlay
+        if show_overlay and homography is not None:
+            _draw_homography_overlay(display, homography, crop_offset)
 
         # Draw all darts in this file
         for i, c in enumerate(file_comps):
@@ -307,8 +384,12 @@ def browse_comparisons(comparisons, labeled_data):
             cp_y += 25
 
         cp_y += 15
-        cv2.putText(cp, "LEFT/RIGHT=file  UP/DOWN=dart  M=filter  Q=quit", (10, cp_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+        overlay_text = "ON" if show_overlay else "OFF"
+        cv2.putText(cp, f"Overlay: {overlay_text}", (10, cp_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        cp_y += 20
+        cv2.putText(cp, "LEFT/RIGHT=file  UP/DOWN=dart  M=filter  O=overlay  Q=quit", (10, cp_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (150, 150, 150), 1)
         cv2.imshow(panel_win, cp)
 
         # Keys
@@ -330,6 +411,9 @@ def browse_comparisons(comparisons, labeled_data):
             file_idx = 0
             dart_idx = 0
             print(f"  Filter: {mode_names[show_mode]}")
+        elif key == ord('o'):
+            show_overlay = not show_overlay
+            print(f"  Overlay: {'ON' if show_overlay else 'OFF'}")
 
     save_window_sizes([win, panel_win])
     cv2.destroyAllWindows()
@@ -382,7 +466,7 @@ def main():
         print_report(comparisons)
 
     if args.browse:
-        browse_comparisons(comparisons, labeled)
+        browse_comparisons(comparisons, labeled, homography, crop_offset)
 
 
 if __name__ == "__main__":
