@@ -269,16 +269,16 @@ def _compute_canonical_destinations(scale_factor=1.0):
     """Return 21 (x, y) float tuples for the canonical board coordinate system.
 
     Point 0: bullseye center at (170, 170).
-    Points 1-20: wire intersections at the outer double ring — where sector
-      boundary wires cross the outer wire.  These are physical features
-      visible on the board, easier to click than sector midpoints.
-      angle = i * 18 - 9 degrees, measured clockwise from 12 o'clock.
+    Points 1-20: sector midpoints at the outer double ring — where each
+      sector number is centered. These are the most visually identifiable
+      landmarks on the board.
+      angle = i * 18 degrees, measured clockwise from 12 o'clock.
     """
     cx, cy = config.CANONICAL_CENTER   # (170, 170)
     r = config.DOUBLE_OUTER_RADIUS     # 170
     destinations = [(float(cx), float(cy))]  # bullseye center
     for i in range(20):
-        angle = i * 18.0 - 9.0  # sector boundary, not midpoint
+        angle = i * 18.0  # sector midpoint (center of sector number)
         x = cx + (r * scale_factor) * math.sin(math.radians(angle))
         y = cy - (r * scale_factor) * math.cos(math.radians(angle))
         destinations.append((x, y))
@@ -376,23 +376,21 @@ def calibrate_board(cap, debug=False):
     _click_frame = captured_frame.copy()
     cv2.setMouseCallback(window, _mouse_callback)
 
-    # Build point labels — each outer click is a wire intersection between
-    # two adjacent sectors.  Boundary i (0-based) sits between
-    # SECTOR_ORDER[(i-1) % 20] and SECTOR_ORDER[i].
+    # Build point labels — each outer click is the center of a sector
+    # at the outer double ring (where the number is).
     SO = config.SECTOR_ORDER
     point_labels = ["1/21: Click the BULLSEYE (center of board)"]
     click_short_labels = ["Bull"]
     for i in range(20):
-        left_sector = SO[(i - 1) % 20]
-        right_sector = SO[i]
+        sector = SO[i]
         hint = ""
         if i == 0:
-            hint = " (near top, start here)"
+            hint = " (top of board, start here)"
         elif i == 10:
-            hint = " (near bottom)"
+            hint = " (bottom of board)"
         point_labels.append(
-            f"{i+2}/21: Wire crossing — {left_sector}/{right_sector}{hint}")
-        click_short_labels.append(f"{left_sector}|{right_sector}")
+            f"{i+2}/21: Center of sector {sector}{hint}")
+        click_short_labels.append(str(sector))
 
     colors = _make_click_colors(21)
 

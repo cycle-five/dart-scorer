@@ -239,18 +239,24 @@ def _guess_segment_from_homography(x, y, homography, crop_offset=(0, 0)):
     try:
         full_x = x + crop_offset[0]
         full_y = y + crop_offset[1]
-        score_info = board.score_from_camera((full_x, full_y), homography)
-        ring = score_info["ring"]
-        sector = score_info["sector"]
-        if ring == "D-BULL":
+        canonical = board.apply_homography((full_x, full_y), homography)
+        r, theta = board.pixel_to_polar(canonical[0], canonical[1])
+
+        # Use angle to determine sector (always works, even if r is off)
+        sector = board.get_sector(theta)
+
+        # Use radius to determine ring, with generous tolerance
+        # (clicking precision at the outer wire is inherently imprecise)
+        if r < config.INNER_BULL_RADIUS + 2:
             return "D_BULL"
-        elif ring == "S-BULL":
+        elif r < config.OUTER_BULL_RADIUS + 2:
             return "S_BULL"
-        elif ring == "miss":
-            return None
+        elif config.TRIPLE_INNER_RADIUS - 5 < r < config.TRIPLE_OUTER_RADIUS + 5:
+            return f"T{sector}"
+        elif config.DOUBLE_INNER_RADIUS - 5 < r < config.DOUBLE_OUTER_RADIUS + 10:
+            return f"D{sector}"
         else:
-            ring_code = {"single": "S", "double": "D", "triple": "T"}[ring]
-            return f"{ring_code}{sector}"
+            return f"S{sector}"
     except Exception:
         return None
 
