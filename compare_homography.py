@@ -442,13 +442,11 @@ def main():
     hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH))
     homography = hom_data['homography']
 
-    # Load crop offset
+    # Crop offset: only needed if homography was calibrated on uncropped frames.
+    # If calibrated with --no-undistort (matching collection pipeline), the
+    # homography is already in cropped space and no offset is needed.
     crop_offset = (0, 0)
-    if config.CROP_ROI_PATH.exists():
-        roi_data = np.load(str(config.CROP_ROI_PATH))
-        roi = roi_data["crop_roi"]
-        crop_offset = (int(roi[0]), int(roi[1]))
-        print(f"Crop offset: {crop_offset}")
+    print(f"Crop offset: {crop_offset} (homography in cropped space)")
 
     # Load labeled data
     labeled = load_labeled_darts(args.outdir)

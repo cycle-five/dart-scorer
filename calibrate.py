@@ -307,7 +307,7 @@ def _mouse_callback(event, x, y, flags, param):
         _click_points.append((x, y))
 
 
-def calibrate_board(cap, debug=False):
+def calibrate_board(cap, debug=False, use_undistort=True):
     """Phase 2: Manual 21-point board calibration.
 
     The user clicks 21 known landmarks on the dartboard to establish both
@@ -315,21 +315,28 @@ def calibrate_board(cap, debug=False):
 
     Points to click (in order):
     1. Bullseye center
-    2-21. Wire intersections at the outer double ring — where each sector
-          boundary wire crosses the outer wire, clockwise from the 5/20
-          boundary (just left of 12 o'clock).
+    2-21. Center of each sector at the outer double ring, clockwise
+          starting from sector 20 at top.
 
-    Wire intersections are physically visible crossings, much easier to
-    click precisely than sector midpoints.
+    IMPORTANT: The homography must be calibrated in the same coordinate
+    space as the collection pipeline. If collection uses --no-undistort,
+    calibrate with --no-undistort too.
     """
     global _click_points, _click_frame
 
-    # --- Load lens calibration ---
-    try:
-        cam_mtx, dist, new_mtx, roi = load_lens_params()
-    except FileNotFoundError as e:
-        print(f"ERROR: {e}")
-        return False
+    # --- Load lens calibration (optional) ---
+    lens_params = None
+    if use_undistort:
+        try:
+            lens_params = load_lens_params()
+            print("Using lens undistortion")
+        except FileNotFoundError:
+            print("WARNING: No lens params found, running without undistortion")
+
+    # --- Load crop ROI (optional) ---
+    crop_roi = load_crop_roi()
+    if crop_roi is not None:
+        print(f"Applying crop ROI: ({crop_roi[0]}, {crop_roi[1]}) {crop_roi[2]}x{crop_roi[3]}")
 
     print("\n=== Board Calibration (Manual 21-Point) ===")
     print("Position camera so the full dartboard is visible.")
@@ -348,8 +355,10 @@ def calibrate_board(cap, debug=False):
                 print("ERROR: Failed to read frame from camera.")
                 return False
 
-            undistorted = undistort_frame(frame, cam_mtx, dist, new_mtx, roi)
-            display = undistorted.copy()
+            if lens_params is not None:
+                frame = undistort_frame(frame, *lens_params)
+            frame = apply_crop(frame, crop_roi)
+            display = frame.copy()
 
             cv2.putText(display, "Press SPACE to capture frame for calibration",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
@@ -363,7 +372,7 @@ def calibrate_board(cap, debug=False):
                 cv2.destroyWindow(window)
                 return False
             elif key == ord(' '):
-                captured_frame = undistorted.copy()
+                captured_frame = frame.copy()
                 print("Frame captured.\n")
                 break
     except KeyboardInterrupt:
@@ -740,6 +749,7 @@ def main():
     parser.add_argument("--lens",  action="store_true", help="Run lens distortion calibration")
     parser.add_argument("--board", action="store_true", help="Run board homography calibration")
     parser.add_argument("--crop",  action="store_true", help="Select crop ROI (dartboard region)")
+    parser.add_argument("--no-undistort", action="store_true", help="Skip lens undistortion (match collection pipeline)")
     parser.add_argument("--debug", action="store_true", help="Show debug visualizations")
     args = parser.parse_args()
 
@@ -759,7 +769,8 @@ def main():
                 print("Crop ROI selection failed.")
                 return
         if args.board:
-            calibrate_board(cap, debug=args.debug)
+            calibrate_board(cap, debug=args.debug,
+                            use_undistort=not getattr(args, 'no_undistort', False))
     except KeyboardInterrupt:
         print("\nInterrupted — exiting cleanly.")
     finally:

@@ -488,10 +488,9 @@ def collect_data(outdir="data/training", use_undistort=True, box_size=30,
         print("WARNING: No lens params found, running without undistortion")
 
     crop_roi = load_crop_roi()
-    crop_offset = (0, 0)
+    crop_offset = (0, 0)  # homography calibrated in cropped space, no offset needed
     if crop_roi is not None:
         x, y, w, h = crop_roi
-        crop_offset = (x, y)
         print(f"Crop ROI: ({x}, {y}) {w}x{h}")
 
     homography = None
@@ -921,9 +920,7 @@ def capture_only(outdir="data/training", use_undistort=True,
         lens_params = load_lens_params()
 
     crop_roi = load_crop_roi()
-    crop_offset = (0, 0)
-    if crop_roi is not None:
-        crop_offset = (crop_roi[0], crop_roi[1])
+    crop_offset = (0, 0)  # homography calibrated in cropped space
 
     audio = None
     video = None
@@ -1158,12 +1155,7 @@ def label_offline(outdir="data/training", box_size=30):
         homography = hom_data['homography']
         print("Board homography loaded — segment guess enabled")
 
-    crop_roi_data = None
-    crop_offset = (0, 0)
-    if config.CROP_ROI_PATH.exists():
-        crop_roi_data = np.load(str(config.CROP_ROI_PATH))
-        roi = crop_roi_data["crop_roi"]
-        crop_offset = (int(roi[0]), int(roi[1]))
+    crop_offset = (0, 0)  # homography calibrated in cropped space
 
     win = "Label Frames"
     panel_win = "Control Panel"
