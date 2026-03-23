@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(os.path.dirname(__file__))
 # ---------------------------------------------------------------------------
 
 # V4L2 device node for the eMeet C950 HD webcam
-CAMERA_DEVICE = "/dev/video4"
+CAMERA_DEVICE = "/dev/video0"
 
 # Native capture resolution of the eMeet C950
 CAMERA_WIDTH = 1920
