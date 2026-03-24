@@ -322,6 +322,7 @@ def render_control_panel(
     collect_remaining=0,
     edit_dart=None,
     edit_text="",
+    prediction_confidences=None,
 ):
     cp_w, cp_h = 400, 380
     cp = np.zeros((cp_h, cp_w, 3), dtype=np.uint8)
@@ -462,13 +463,15 @@ def render_control_panel(
 
     # Show labels prominently in REVIEW
     if state == UIState.REVIEW and session:
+        confs = prediction_confidences or {}
         for ax, ay, cls_name in session.annotations:
             info = parse_class_name(cls_name)
             colors_d = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
             color_d = colors_d.get(info["ordinal"], (255, 255, 255))
+            conf_str = f" ({confs[cls_name]:.0%})" if cls_name in confs else ""
             cv2.putText(
                 cp,
-                f"  d{info['ordinal']}: {info['label']}",
+                f"  d{info['ordinal']}: {info['label']}{conf_str}",
                 (10, cp_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -621,9 +624,10 @@ def render_camera_hud(
     )
 
 
-def render_annotations(display, session, box_size):
+def render_annotations(display, session, box_size, prediction_confidences=None):
     if session is None:
         return
+    confs = prediction_confidences or {}
     colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
     half = box_size // 2
     for ax, ay, cls_name in session.annotations:
@@ -631,7 +635,8 @@ def render_annotations(display, session, box_size):
         color = colors.get(info["ordinal"], (255, 255, 255))
         cv2.rectangle(display, (ax - half, ay - half), (ax + half, ay + half), color, 2)
         cv2.circle(display, (ax, ay), 3, color, -1)
-        label = f"d{info['ordinal']} {info['segment']}"
+        conf_str = f" {confs[cls_name]:.0%}" if cls_name in confs else ""
+        label = f"d{info['ordinal']} {info['segment']}{conf_str}"
         cv2.putText(
             display,
             label,
@@ -707,27 +712,26 @@ _auto_confirmed = [False]  # signal that a click auto-confirmed
 def _predict_annotations(yolo_model, batch_frames, conf=0.25):
     """Run YOLO on batch frames and build annotation lists with carry-forward.
 
-    Returns list of (annotations_list, dart_ordinal) per frame,
-    or None if prediction fails.
+    Annotations are (x, y, class_name) tuples (same as manual).
+    Also returns a confidence dict keyed by class_name for display.
+    Returns (annotations_list_per_frame, confidence_dict) or (None, None).
     """
     if yolo_model is None or not batch_frames:
-        return None
+        return None, None
 
-    from classes import ID_TO_CLASS, parse_class_name
+    from classes import ID_TO_CLASS, CLASS_TO_ID, parse_class_name, make_class_name
 
     all_frame_annotations = []
     previous = []
-    ordinal = 1
+    confidences = {}  # cls_name -> confidence
 
     for fi, frame in enumerate(batch_frames):
         results = yolo_model.predict(frame, conf=conf, verbose=False)
         if not results or len(results) == 0 or results[0].boxes is None:
-            return None  # fall back to manual
+            return None, None
 
         boxes = results[0].boxes
-        # Find the detection for the current dart ordinal
-        # (highest confidence detection not already in previous)
-        frame_annotations = list(previous)  # carry forward
+        frame_annotations = list(previous)
 
         for box in sorted(boxes, key=lambda b: float(b.conf[0]), reverse=True):
             cls_id = int(box.cls[0])
@@ -735,13 +739,18 @@ def _predict_annotations(yolo_model, batch_frames, conf=0.25):
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
 
-            cls_name = ID_TO_CLASS.get(cls_id, None)
-            if cls_name is None:
+            raw_cls_name = ID_TO_CLASS.get(cls_id, None)
+            if raw_cls_name is None:
                 continue
 
-            info = parse_class_name(cls_name)
+            # Extract segment and remap to correct ordinal for this frame
+            info = parse_class_name(raw_cls_name)
+            correct_ordinal = len(frame_annotations) + 1  # 1-based
+            correct_cls_name = make_class_name(correct_ordinal, info["segment"])
+            if correct_cls_name not in CLASS_TO_ID:
+                continue
 
-            # Skip if this is a carry-forward dart (close to an existing annotation)
+            # Skip if close to existing annotation
             is_duplicate = False
             for (ax, ay, _) in frame_annotations:
                 if abs(cx - ax) < 30 and abs(cy - ay) < 30:
@@ -750,18 +759,17 @@ def _predict_annotations(yolo_model, batch_frames, conf=0.25):
             if is_duplicate:
                 continue
 
-            # This is a new dart — add it
-            frame_annotations.append((cx, cy, cls_name))
-            break  # only one new dart per frame
+            frame_annotations.append((cx, cy, correct_cls_name))
+            confidences[correct_cls_name] = cls_conf
+            break
 
         if len(frame_annotations) <= len(previous):
-            return None  # couldn't find a new dart, fall back to manual
+            return None, None
 
         all_frame_annotations.append(frame_annotations)
         previous = list(frame_annotations)
-        ordinal = len(frame_annotations) + 1
 
-    return all_frame_annotations
+    return all_frame_annotations, confidences
 
 
 def _mouse_callback(event, x, y, flags, param):
@@ -886,6 +894,8 @@ def collect_data(
     cooldown_start = 0.0
     edit_dart = None  # REVIEW edit state: None=not editing, 0=picking dart#, 1-3=typing
     edit_text = ""
+    prediction_confidences = {}  # cls_name -> confidence for display
+    review_enter_time = 0.0  # when REVIEW state was entered
 
     try:
         while True:
@@ -945,8 +955,9 @@ def collect_data(
 
                     if n >= 3:
                         # All 3 darts captured — try model prediction first
-                        predicted = _predict_annotations(yolo_model, batch_frames)
+                        predicted, pred_confs = _predict_annotations(yolo_model, batch_frames)
                         if predicted:
+                            prediction_confidences = pred_confs or {}
                             # Model predicted all darts — save and go to REVIEW
                             for fi, anns in enumerate(predicted):
                                 h_img, w_img = batch_frames[fi].shape[:2]
@@ -970,6 +981,7 @@ def collect_data(
                                                         start_ordinal=dart_ordinal, crop_offset=crop_offset)
                             _session_ref[0] = session
                             state = UIState.REVIEW
+                            review_enter_time = time.monotonic()
                             for (_, _, cn) in predicted[-1]:
                                 info = parse_class_name(cn)
                                 print(f"    d{info['ordinal']}: {info['label']}")
@@ -1008,8 +1020,9 @@ def collect_data(
 
                 elif collect_remaining <= 0:
                     # Timeout — try model prediction first
-                    predicted = _predict_annotations(yolo_model, batch_frames)
+                    predicted, pred_confs = _predict_annotations(yolo_model, batch_frames)
                     if predicted:
+                        prediction_confidences = pred_confs or {}
                         for fi, anns in enumerate(predicted):
                             h_img, w_img = batch_frames[fi].shape[:2]
                             fname = f"frame_{frame_counter:05d}.png"
@@ -1031,6 +1044,7 @@ def collect_data(
                                                     start_ordinal=dart_ordinal, crop_offset=crop_offset)
                         _session_ref[0] = session
                         state = UIState.REVIEW
+                        review_enter_time = time.monotonic()
                         print(f"  Timeout — model predicted {len(batch_frames)} frame(s), pull darts or X to edit")
                     else:
                         state = UIState.ANNOTATING
@@ -1088,7 +1102,7 @@ def collect_data(
             )
 
             if state in (UIState.ANNOTATING, UIState.REVIEW) and session:
-                render_annotations(display, session, box_size)
+                render_annotations(display, session, box_size, prediction_confidences)
 
             cv2.imshow(win, display)
 
@@ -1105,6 +1119,7 @@ def collect_data(
                 collect_remaining,
                 edit_dart,
                 edit_text,
+                prediction_confidences,
             )
             cv2.imshow(panel_win, cp)
 
@@ -1247,6 +1262,7 @@ def collect_data(
                     else:
                         # All frames done — go to REVIEW
                         state = UIState.REVIEW
+                        review_enter_time = time.monotonic()
                         print("  All labeled — pull darts or X to edit")
 
                 if state == UIState.ANNOTATING and session:
@@ -1365,10 +1381,12 @@ def collect_data(
                     elif 32 <= key < 127:
                         edit_text += chr(key)
 
-                elif key == ord("r") or (edit_dart is None and video and video.saw_disturbance()):
+                elif key == ord("r") or (edit_dart is None and video and video.saw_disturbance()
+                                         and time.monotonic() - review_enter_time > 2.0):
                     # Accept and move on
                     edit_dart = None
                     edit_text = ""
+                    prediction_confidences = {}
                     dart_ordinal = 1
                     previous_annotations = []
                     batch_frames = []
