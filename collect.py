@@ -704,6 +704,66 @@ _session_ref = [None]
 _auto_confirmed = [False]  # signal that a click auto-confirmed
 
 
+def _predict_annotations(yolo_model, batch_frames, conf=0.25):
+    """Run YOLO on batch frames and build annotation lists with carry-forward.
+
+    Returns list of (annotations_list, dart_ordinal) per frame,
+    or None if prediction fails.
+    """
+    if yolo_model is None or not batch_frames:
+        return None
+
+    from classes import ID_TO_CLASS, parse_class_name
+
+    all_frame_annotations = []
+    previous = []
+    ordinal = 1
+
+    for fi, frame in enumerate(batch_frames):
+        results = yolo_model.predict(frame, conf=conf, verbose=False)
+        if not results or len(results) == 0 or results[0].boxes is None:
+            return None  # fall back to manual
+
+        boxes = results[0].boxes
+        # Find the detection for the current dart ordinal
+        # (highest confidence detection not already in previous)
+        frame_annotations = list(previous)  # carry forward
+
+        for box in sorted(boxes, key=lambda b: float(b.conf[0]), reverse=True):
+            cls_id = int(box.cls[0])
+            cls_conf = float(box.conf[0])
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+
+            cls_name = ID_TO_CLASS.get(cls_id, None)
+            if cls_name is None:
+                continue
+
+            info = parse_class_name(cls_name)
+
+            # Skip if this is a carry-forward dart (close to an existing annotation)
+            is_duplicate = False
+            for (ax, ay, _) in frame_annotations:
+                if abs(cx - ax) < 30 and abs(cy - ay) < 30:
+                    is_duplicate = True
+                    break
+            if is_duplicate:
+                continue
+
+            # This is a new dart — add it
+            frame_annotations.append((cx, cy, cls_name))
+            break  # only one new dart per frame
+
+        if len(frame_annotations) <= len(previous):
+            return None  # couldn't find a new dart, fall back to manual
+
+        all_frame_annotations.append(frame_annotations)
+        previous = list(frame_annotations)
+        ordinal = len(frame_annotations) + 1
+
+    return all_frame_annotations
+
+
 def _mouse_callback(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
         session = _session_ref[0]
@@ -782,6 +842,17 @@ def collect_data(
         video = VideoTrigger(threshold=video_threshold)
         print(f"Video trigger: ACTIVE (threshold={video_threshold:.1f})")
 
+    # Load YOLO model for prediction-assisted labeling (optional)
+    yolo_model = None
+    model_weights = config.PROJECT_ROOT / "runs" / "detect" / "dartscorer" / "weights" / "best.pt"
+    if model_weights.exists():
+        try:
+            from ultralytics import YOLO
+            yolo_model = YOLO(str(model_weights))
+            print(f"YOLO model loaded for assisted labeling")
+        except Exception as e:
+            print(f"WARNING: Could not load YOLO model: {e}")
+
     win = "Collect Training Data"
     panel_win = "Control Panel"
     create_window(win, default_width=960, default_height=540)
@@ -793,6 +864,8 @@ def collect_data(
     print(f"Continuing from frame {frame_counter}")
     print(f"Batch mode: throw up to 3 darts, then annotate all")
     print(f"Collect timeout: {collect_timeout}s after first dart")
+    if yolo_model:
+        print(f"Model-assisted labeling: ON")
     print()
 
     # --- State ---
@@ -871,19 +944,46 @@ def collect_data(
                         collect_start = time.monotonic()
 
                     if n >= 3:
-                        # All 3 darts captured, go to annotation
-                        state = UIState.ANNOTATING
-                        batch_index = 0
-                        dart_ordinal = 1
-                        previous_annotations = []
-                        session = AnnotationSession(
-                            homography=homography,
-                            previous_annotations=[],
-                            start_ordinal=1,
-                            crop_offset=crop_offset,
-                        )
-                        _session_ref[0] = session
-                        print(f"  3 darts captured — annotate frame 1")
+                        # All 3 darts captured — try model prediction first
+                        predicted = _predict_annotations(yolo_model, batch_frames)
+                        if predicted:
+                            # Model predicted all darts — save and go to REVIEW
+                            for fi, anns in enumerate(predicted):
+                                h_img, w_img = batch_frames[fi].shape[:2]
+                                fname = f"frame_{frame_counter:05d}.png"
+                                cv2.imwrite(str(img_dir / fname), batch_frames[fi])
+                                label_name = f"frame_{frame_counter:05d}.txt"
+                                with open(label_dir / label_name, "w") as lf:
+                                    for (ax, ay, cn) in anns:
+                                        cls_id = CLASS_TO_ID[cn]
+                                        lf.write(f"{cls_id} {ax/w_img:.6f} {ay/h_img:.6f} "
+                                                 f"{box_size/w_img:.6f} {box_size/h_img:.6f}\n")
+                                entry = {"filename": fname, "darts": [{"x": ax, "y": ay, "class": cn} for (ax, ay, cn) in anns],
+                                         "n_darts": len(anns), "timestamp": time.time()}
+                                with open(annotations_path, "a") as f:
+                                    f.write(json.dumps(entry) + "\n")
+                                frame_counter += 1
+                                print(f"  Auto-saved: {fname} with {len(anns)} dart(s)")
+                            previous_annotations = list(predicted[-1])
+                            dart_ordinal = len(predicted[-1]) + 1
+                            session = AnnotationSession(homography=homography, previous_annotations=previous_annotations,
+                                                        start_ordinal=dart_ordinal, crop_offset=crop_offset)
+                            _session_ref[0] = session
+                            state = UIState.REVIEW
+                            for (_, _, cn) in predicted[-1]:
+                                info = parse_class_name(cn)
+                                print(f"    d{info['ordinal']}: {info['label']}")
+                            print("  Model predicted — pull darts or X to edit")
+                        else:
+                            # Fall back to manual
+                            state = UIState.ANNOTATING
+                            batch_index = 0
+                            dart_ordinal = 1
+                            previous_annotations = []
+                            session = AnnotationSession(homography=homography, previous_annotations=[],
+                                                        start_ordinal=1, crop_offset=crop_offset)
+                            _session_ref[0] = session
+                            print(f"  3 darts captured — click tips to annotate")
                     else:
                         state = UIState.COLLECTING
 
@@ -907,21 +1007,40 @@ def collect_data(
                     )
 
                 elif collect_remaining <= 0:
-                    # Timeout — go to annotation with what we have
-                    state = UIState.ANNOTATING
-                    batch_index = 0
-                    dart_ordinal = 1
-                    previous_annotations = []
-                    session = AnnotationSession(
-                        homography=homography,
-                        previous_annotations=[],
-                        start_ordinal=1,
-                        crop_offset=crop_offset,
-                    )
-                    _session_ref[0] = session
-                    print(
-                        f"  Timeout — {len(batch_frames)} frame(s) captured, annotate frame 1"
-                    )
+                    # Timeout — try model prediction first
+                    predicted = _predict_annotations(yolo_model, batch_frames)
+                    if predicted:
+                        for fi, anns in enumerate(predicted):
+                            h_img, w_img = batch_frames[fi].shape[:2]
+                            fname = f"frame_{frame_counter:05d}.png"
+                            cv2.imwrite(str(img_dir / fname), batch_frames[fi])
+                            label_name = f"frame_{frame_counter:05d}.txt"
+                            with open(label_dir / label_name, "w") as lf:
+                                for (ax, ay, cn) in anns:
+                                    cls_id = CLASS_TO_ID[cn]
+                                    lf.write(f"{cls_id} {ax/w_img:.6f} {ay/h_img:.6f} "
+                                             f"{box_size/w_img:.6f} {box_size/h_img:.6f}\n")
+                            entry = {"filename": fname, "darts": [{"x": ax, "y": ay, "class": cn} for (ax, ay, cn) in anns],
+                                     "n_darts": len(anns), "timestamp": time.time()}
+                            with open(annotations_path, "a") as f:
+                                f.write(json.dumps(entry) + "\n")
+                            frame_counter += 1
+                        previous_annotations = list(predicted[-1])
+                        dart_ordinal = len(predicted[-1]) + 1
+                        session = AnnotationSession(homography=homography, previous_annotations=previous_annotations,
+                                                    start_ordinal=dart_ordinal, crop_offset=crop_offset)
+                        _session_ref[0] = session
+                        state = UIState.REVIEW
+                        print(f"  Timeout — model predicted {len(batch_frames)} frame(s), pull darts or X to edit")
+                    else:
+                        state = UIState.ANNOTATING
+                        batch_index = 0
+                        dart_ordinal = 1
+                        previous_annotations = []
+                        session = AnnotationSession(homography=homography, previous_annotations=[],
+                                                    start_ordinal=1, crop_offset=crop_offset)
+                        _session_ref[0] = session
+                        print(f"  Timeout — {len(batch_frames)} frame(s), click tips to annotate")
 
             elif state == UIState.PULL_DARTS:
                 if video:
@@ -934,6 +1053,13 @@ def collect_data(
                     else:
                         # Phase 2: wait for board to stabilize after pull
                         if video.is_calm():
+                            # Save background frame (empty board)
+                            bg_fname = f"frame_{frame_counter:05d}.png"
+                            cv2.imwrite(str(img_dir / bg_fname), frame)
+                            with open(label_dir / f"frame_{frame_counter:05d}.txt", "w") as lf:
+                                pass  # empty label = background
+                            frame_counter += 1
+                            print(f"  Background saved: {bg_fname}")
                             state = UIState.LISTENING
                             print("  Board stable — listening")
                 else:
