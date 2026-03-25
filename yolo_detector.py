@@ -16,7 +16,44 @@ from board import classify_dart, apply_homography
 
 
 RUNS_DIR = config.PROJECT_ROOT / "runs"
-DEFAULT_WEIGHTS = RUNS_DIR / "detect" / "dartscorer_v2" / "weights" / "best.pt"
+
+# Resolution-tagged model directories: dartscorer_v2_{W}x{H}
+# Falls back to any dartscorer_v2* model if no exact match
+def find_best_weights(frame_width=None, frame_height=None):
+    """Find the best YOLO weights for a given resolution.
+
+    Looks for runs/detect/dartscorer_v2_{W}x{H}/weights/best.pt first,
+    then falls back to any dartscorer_v2*/weights/best.pt.
+
+    Returns:
+        Path to best.pt, or None if no model found.
+    """
+    detect_dir = RUNS_DIR / "detect"
+    if not detect_dir.exists():
+        return None
+
+    # Try exact resolution match first
+    if frame_width and frame_height:
+        exact = detect_dir / f"dartscorer_v2_{frame_width}x{frame_height}" / "weights" / "best.pt"
+        if exact.exists():
+            return exact
+
+    # Fall back to any v2 model (prefer resolution-tagged, then generic)
+    candidates = []
+    for d in sorted(detect_dir.iterdir()):
+        if d.is_dir() and d.name.startswith("dartscorer_v2"):
+            best = d / "weights" / "best.pt"
+            if best.exists():
+                candidates.append(best)
+
+    # Prefer the most recently modified
+    if candidates:
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    return None
+
+
+DEFAULT_WEIGHTS = find_best_weights() or (RUNS_DIR / "detect" / "dartscorer_v2" / "weights" / "best.pt")
 
 
 def _estimate_tip(bbox, board_center):

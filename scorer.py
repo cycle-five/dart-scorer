@@ -132,10 +132,20 @@ def main():
         crop_offset = (x, y)
         print(f"Crop ROI: ({x}, {y}) {w}x{h}")
 
-    # --- Load YOLO model ---
+    # --- Load YOLO model (resolution-aware) ---
+    weights = args.weights
+    if weights is None:
+        # Auto-select best model for current crop resolution
+        from yolo_detector import find_best_weights
+        crop_w = crop_roi[2] if crop_roi is not None else config.CAMERA_WIDTH
+        crop_h = crop_roi[3] if crop_roi is not None else config.CAMERA_HEIGHT
+        weights = find_best_weights(crop_w, crop_h)
+        if weights:
+            print(f"Auto-selected model: {weights.parent.parent.name}")
+
     try:
         detector = YOLODartDetector(
-            weights=args.weights,
+            weights=weights,
             conf=args.conf,
             homography=homography,
             crop_offset=crop_offset,
