@@ -52,11 +52,120 @@ from window_manager import create_window, save_window_sizes
 # ---------------------------------------------------------------------------
 
 
-def auto_expand_bbox(tip_x, tip_y, img_w, img_h, board_center=None):
+def detect_shaft_direction(gray, tip_x, tip_y, sigma=None):
+    """Detect dart shaft direction from image structure around the tip.
+
+    Uses the structure tensor (Gaussian-weighted gradient covariance) to
+    find the dominant linear feature near the tip. The eigenvector of the
+    *smaller* eigenvalue gives the shaft axis — the direction of least
+    gradient variation, i.e. along the shaft.
+
+    Args:
+        gray: Grayscale image (uint8 or float32).
+        tip_x, tip_y: Tip pixel coordinates.
+        sigma: Gaussian weighting radius. Defaults to ~5% of frame width.
+
+    Returns:
+        (dx, dy) unit vector along shaft direction (away from tip toward
+        flights), or None if no clear linear feature found.
+    """
+    import math
+
+    h, w = gray.shape[:2]
+    if sigma is None:
+        sigma = max(8, int(w * 0.02))
+
+    r = int(3 * sigma)
+    ix, iy = int(round(tip_x)), int(round(tip_y))
+    x1 = max(0, ix - r)
+    y1 = max(0, iy - r)
+    x2 = min(w, ix + r + 1)
+    y2 = min(h, iy + r + 1)
+
+    if x2 - x1 < 5 or y2 - y1 < 5:
+        return None
+
+    roi = gray[y1:y2, x1:x2].astype(np.float32)
+
+    # Image gradients
+    gx = cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
+
+    # Gaussian weight centered on tip within ROI
+    cx_roi = tip_x - x1
+    cy_roi = tip_y - y1
+    Y, X = np.mgrid[0:roi.shape[0], 0:roi.shape[1]]
+    gauss = np.exp(-((X - cx_roi) ** 2 + (Y - cy_roi) ** 2) / (2 * sigma ** 2))
+
+    # Structure tensor: M = [[Σ(g·Ix²),  Σ(g·Ix·Iy)],
+    #                        [Σ(g·Ix·Iy), Σ(g·Iy²)]]
+    Sxx = np.sum(gauss * gx * gx)
+    Syy = np.sum(gauss * gy * gy)
+    Sxy = np.sum(gauss * gx * gy)
+
+    # Eigenvalues of 2x2 symmetric matrix
+    trace = Sxx + Syy
+    det = Sxx * Syy - Sxy * Sxy
+    disc = max(0, trace ** 2 / 4 - det)
+    sqrt_disc = math.sqrt(disc)
+    lambda1 = trace / 2 + sqrt_disc  # larger eigenvalue
+    lambda2 = trace / 2 - sqrt_disc  # smaller eigenvalue
+
+    # Check anisotropy: if eigenvalues are similar, no clear linear feature
+    if lambda1 < 1e-6 or lambda2 / lambda1 > 0.6:
+        return None  # isotropic texture, no shaft detected
+
+    # Eigenvector of lambda2 (smaller eigenvalue) = shaft direction
+    # (direction of least gradient variation = along the shaft)
+    if abs(Sxy) > 1e-6:
+        vx = lambda2 - Syy
+        vy = Sxy
+    else:
+        # Axis-aligned: shaft is along the direction of less gradient energy
+        if Sxx < Syy:
+            vx, vy = 1.0, 0.0
+        else:
+            vx, vy = 0.0, 1.0
+
+    # Normalize
+    length = math.sqrt(vx * vx + vy * vy)
+    if length < 1e-6:
+        return None
+    vx /= length
+    vy /= length
+
+    # The eigenvector gives a LINE (two directions). Disambiguate:
+    # Sample intensity along both directions from the tip.
+    # The shaft side will have higher contrast (dart pixels),
+    # the tip side has the board.
+    sample_dist = max(5, int(sigma * 0.8))
+    def sample_variance(dx, dy, dist):
+        pts = []
+        for t in range(3, dist):
+            sx = int(round(tip_x + dx * t))
+            sy = int(round(tip_y + dy * t))
+            if 0 <= sx < w and 0 <= sy < h:
+                pts.append(float(gray[sy, sx]))
+        return np.var(pts) if len(pts) > 3 else 0
+
+    var_pos = sample_variance(vx, vy, sample_dist)
+    var_neg = sample_variance(-vx, -vy, sample_dist)
+
+    # Shaft side has more intensity variation (shaft edges, flights)
+    if var_neg > var_pos:
+        vx, vy = -vx, -vy
+
+    return (vx, vy)
+
+
+def auto_expand_bbox(tip_x, tip_y, img_w, img_h, board_center=None, frame=None):
     """Expand a tip click to a full-dart bounding box.
 
-    Extends along the radial direction (away from board center) to capture
-    the dart shaft. Returns (cx, cy, w, h) in normalized [0,1] coordinates.
+    If a frame is provided, uses structure tensor analysis to detect the
+    actual shaft direction from image features. Falls back to the radial
+    direction from board center if detection fails or no frame is given.
+
+    Returns (cx, cy, w, h) in normalized [0,1] coordinates.
     """
     import math
 
@@ -65,7 +174,28 @@ def auto_expand_bbox(tip_x, tip_y, img_w, img_h, board_center=None):
     EXPAND_LATERAL = int(round(config.BBOX_EXPAND_LATERAL_FRAC * img_h))
     MIN_BOX = int(round(config.BBOX_MIN_SIZE_FRAC * img_w))
 
-    if board_center is not None:
+    # Try image-based shaft detection first
+    shaft_dir = None
+    if frame is not None:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+        shaft_dir = detect_shaft_direction(gray, tip_x, tip_y)
+
+    if shaft_dir is not None:
+        sx, sy = shaft_dir
+        # Disambiguate: if we have a board center, the shaft should point
+        # AWAY from center.  If the detected direction points toward center
+        # (>90° from the away-from-center direction), flip it.
+        if board_center is not None:
+            bcx, bcy = board_center
+            away_x = tip_x - bcx
+            away_y = tip_y - bcy
+            dot = sx * away_x + sy * away_y
+            if dot < 0:
+                sx, sy = -sx, -sy
+        # "toward center" = opposite of shaft (past the tip)
+        dx, dy = -sx, -sy
+    elif board_center is not None:
+        # Fallback: radial direction toward board center
         bcx, bcy = board_center
         dx = bcx - tip_x
         dy = bcy - tip_y
@@ -75,6 +205,7 @@ def auto_expand_bbox(tip_x, tip_y, img_w, img_h, board_center=None):
         else:
             dx, dy = 0, -1
     else:
+        # Last resort: toward image center
         dx = img_w / 2 - tip_x
         dy = img_h / 2 - tip_y
         dist = math.sqrt(dx * dx + dy * dy)
@@ -1070,7 +1201,7 @@ def collect_data(
                                 label_name = f"frame_{frame_counter:05d}.txt"
                                 with open(label_dir / label_name, "w") as lf:
                                     for (ax, ay, seg) in anns:
-                                        bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center)
+                                        bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[fi])
                                         lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                                 entry = {"filename": fname,
                                          "darts": [{"tip_x": ax, "tip_y": ay, "segment": seg} for (ax, ay, seg) in anns],
@@ -1135,7 +1266,7 @@ def collect_data(
                             label_name = f"frame_{frame_counter:05d}.txt"
                             with open(label_dir / label_name, "w") as lf:
                                 for (ax, ay, seg) in anns:
-                                    bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center)
+                                    bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[fi])
                                     lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                             entry = {"filename": fname,
                                      "darts": [{"tip_x": ax, "tip_y": ay, "segment": seg} for (ax, ay, seg) in anns],
@@ -1326,7 +1457,7 @@ def collect_data(
                     label_name = f"frame_{frame_counter:05d}.txt"
                     with open(label_dir / label_name, "w") as lf:
                         for ax, ay, seg in session.annotations:
-                            bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center)
+                            bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[batch_index])
                             lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                     entry = {
                         "filename": fname,
@@ -1454,7 +1585,7 @@ def collect_data(
                                 if fi + 1 >= edit_dart:
                                     with open(label_dir / label_name, "w") as lf:
                                         for (aax, aay, sseg) in frame_anns:
-                                            bcx, bcy, bw, bh = auto_expand_bbox(aax, aay, w_img, h_img, board_center)
+                                            bcx, bcy, bw, bh = auto_expand_bbox(aax, aay, w_img, h_img, board_center, frame=batch_frames[fi])
                                             lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                                     print(f"  Updated: {label_name}")
                             # Update carry-forward
@@ -2014,7 +2145,7 @@ def label_offline(outdir="data/training", box_size=30):
                 label_name = img_path.stem + ".txt"
                 with open(label_dir / label_name, "w") as lf:
                     for ax, ay, seg in session.annotations:
-                        bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w, h, board_center=None)
+                        bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w, h, board_center=None, frame=frame)
                         lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
 
                 entry = {
