@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-scorer.py — Main dart scoring loop using YOLO detection.
+scorer.py — V2 dart scoring: YOLO detection + geometry classification.
 
-Runs YOLO inference on camera frames to detect darts, classify their
-board segment, and optionally track a game (301 or 501).
+Uses a 1-class YOLO model to find darts, then board homography to
+classify each dart by segment (sector + ring). No ordinal prediction —
+darts are numbered by order of appearance.
 
 Usage:
     python scorer.py                    # Raw detection mode
@@ -31,7 +32,7 @@ from yolo_detector import YOLODartDetector
 
 class State(Enum):
     WAITING = auto()             # No new darts, waiting for throw
-    WAITING_FOR_REMOVAL = auto() # Dart(s) on board, waiting for player to remove
+    WAITING_FOR_REMOVAL = auto() # Dart(s) on board, waiting for removal
 
 
 def init_csv_log():
@@ -42,23 +43,23 @@ def init_csv_log():
         with open(log_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['timestamp', 'tip_x', 'tip_y',
-                           'class_name', 'confidence',
-                           'sector', 'ring', 'multiplier', 'score', 'label',
+                           'segment', 'yolo_confidence', 'geo_confidence',
+                           'score', 'label',
                            'ordinal', 'game_mode', 'remaining'])
 
 
 def log_detection(det, game_mode=None, remaining=None):
     """Append a detection to the CSV log."""
-    info = det["score_info"]
     with open(config.LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
             datetime.now().isoformat(),
             det["tip"][0], det["tip"][1],
-            det["class_name"], f"{det['confidence']:.3f}",
-            info["sector"], info["ring"],
-            info["multiplier"], info["score"], info["label"],
-            info["ordinal"],
+            det["segment"],
+            f"{det['yolo_confidence']:.3f}",
+            f"{det['confidence']:.3f}",
+            det["score"], det["label"],
+            det.get("ordinal", ""),
             game_mode or '',
             remaining if remaining is not None else '',
         ])
@@ -99,42 +100,58 @@ class GameTracker:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="YOLO dart scoring system")
+    parser = argparse.ArgumentParser(description="V2 dart scoring: YOLO + geometry")
     parser.add_argument("--game", type=int, choices=config.SUPPORTED_GAMES,
                        help="Game mode (301 or 501)")
     parser.add_argument("--debug", action="store_true",
-                       help="Show detection details")
+                       help="Show detection details and bboxes")
     parser.add_argument("--conf", type=float, default=0.25,
                        help="YOLO confidence threshold (default: 0.25)")
     parser.add_argument("--weights", type=str, default=None,
                        help="Path to YOLO weights file")
+    parser.add_argument("--no-undistort", action="store_true",
+                       help="Skip lens undistortion")
     args = parser.parse_args()
+
+    # --- Load homography ---
+    homography = None
+    if config.BOARD_HOMOGRAPHY_PATH.exists():
+        data = np.load(str(config.BOARD_HOMOGRAPHY_PATH))
+        homography = data["homography"]
+        print("Board homography loaded.")
+    else:
+        print("WARNING: No board homography found. Scoring will not work.")
+        print("Run: uv run python calibrate.py --board")
+
+    # --- Crop ROI ---
+    from calibrate import open_camera, load_crop_roi, apply_crop
+    crop_roi = load_crop_roi()
+    crop_offset = (0, 0)
+    if crop_roi is not None:
+        x, y, w, h = crop_roi
+        crop_offset = (x, y)
+        print(f"Crop ROI: ({x}, {y}) {w}x{h}")
 
     # --- Load YOLO model ---
     try:
         detector = YOLODartDetector(
             weights=args.weights,
             conf=args.conf,
+            homography=homography,
+            crop_offset=crop_offset,
         )
     except FileNotFoundError as e:
         print(f"ERROR: {e}")
         sys.exit(1)
 
-    print("YOLO model loaded.")
+    print("YOLO v2 detector loaded (1-class + geometry).")
 
     # --- Optional lens undistortion ---
     lens_params = None
-    if config.LENS_PARAMS_PATH.exists():
+    if not args.no_undistort and config.LENS_PARAMS_PATH.exists():
         from calibrate import load_lens_params, undistort_frame
         lens_params = load_lens_params()
-        print("Lens undistortion enabled")
-
-    # --- Crop ROI ---
-    from calibrate import open_camera, load_crop_roi, apply_crop
-    crop_roi = load_crop_roi()
-    if crop_roi is not None:
-        x, y, w, h = crop_roi
-        print(f"Crop ROI: ({x}, {y}) {w}x{h}")
+        print("Lens undistortion enabled.")
 
     # --- Setup ---
     cap = open_camera()
@@ -149,11 +166,10 @@ def main():
 
     state = State.WAITING
     last_score_label = None
-    # Track how many consecutive frames we see zero darts (for removal detection)
     empty_frames = 0
-    REMOVAL_THRESHOLD = 10  # frames with 0 detections to confirm darts pulled
+    REMOVAL_THRESHOLD = 10
 
-    window = "Dart Scorer (YOLO)"
+    window = "Dart Scorer v2"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
 
     print("\nScoring active. Controls:")
@@ -176,7 +192,7 @@ def main():
 
             display = frame.copy()
 
-            # Run YOLO
+            # Run YOLO detection + geometry classification
             detections = detector.process_frame(frame)
 
             if state == State.WAITING:
@@ -184,20 +200,34 @@ def main():
 
                 for det in new_darts:
                     detector.confirm_dart(det)
-                    info = det["score_info"]
-                    last_score_label = f"d{info['ordinal']} {info['label']}"
+                    ordinal = det["ordinal"]
+                    segment = det["segment"]
+                    score = det["score"]
+                    label = det["label"]
+                    geo_conf = det["confidence"]
 
-                    print(f">>> DART {info['ordinal']}: {info['label']} "
-                          f"(conf={det['confidence']:.2f})")
+                    # Confidence indicator
+                    conf_marker = ""
+                    if geo_conf < 0.4:
+                        conf_marker = " [?]"
+                    elif geo_conf < 0.75:
+                        conf_marker = " [~]"
+
+                    last_score_label = f"dart {ordinal}: {label}{conf_marker}"
+
+                    print(f">>> DART {ordinal}: {label}"
+                          f"  (yolo={det['yolo_confidence']:.0%}"
+                          f", geo={geo_conf:.0%}){conf_marker}")
 
                     if game:
-                        remaining, bust = game.add_score(info["score"])
+                        remaining, bust = game.add_score(score)
                         if bust:
                             print(f"    (Bust)")
                         else:
                             print(f"    {game.get_display_text()}")
                         if game.is_finished():
-                            print(f"\n*** GAME OVER! {game_mode} in {game.darts_thrown} darts! ***\n")
+                            print(f"\n*** GAME OVER! {game_mode} in "
+                                  f"{game.darts_thrown} darts! ***\n")
 
                     log_detection(det, game_mode,
                                  game.remaining if game else None)
@@ -206,7 +236,6 @@ def main():
                     state = State.WAITING_FOR_REMOVAL
                     empty_frames = 0
                 elif detector.round_dart_count > 0 and len(detections) == 0:
-                    # Darts may have been pulled mid-round
                     empty_frames += 1
                     if empty_frames >= REMOVAL_THRESHOLD:
                         print("  (Darts removed — new round)\n")
@@ -235,28 +264,29 @@ def main():
 
             if last_score_label:
                 cv2.putText(display, last_score_label, (10, 40),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
             if game:
-                cv2.putText(display, game.get_display_text(), (10, 80),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(display, game.get_display_text(), (10, 75),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 if game.is_finished():
-                    cv2.putText(display, "GAME OVER!", (10, 120),
+                    cv2.putText(display, "GAME OVER!", (10, 110),
                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
 
             # State + dart count
             state_text = f"{state.name} | Darts: {detector.round_dart_count}/3"
             h_disp = display.shape[0]
-            cv2.putText(display, state_text, (10, h_disp - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            cv2.putText(display, state_text, (10, h_disp - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-            # Draw confirmed dart markers
-            for ordinal, dart in detector.confirmed_darts.items():
-                tx, ty = dart["tip"]
-                colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
-                color = colors.get(ordinal, (255, 255, 255))
-                cv2.circle(display, (tx, ty), 8, color, 2)
-                cv2.circle(display, (tx, ty), 2, color, -1)
+            # Draw confirmed dart markers (when not in debug mode)
+            if not args.debug:
+                for ordinal, dart in detector.confirmed_darts.items():
+                    tx, ty = dart["tip"]
+                    colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
+                    color = colors.get(ordinal, (255, 255, 255))
+                    cv2.circle(display, (tx, ty), 8, color, 2)
+                    cv2.circle(display, (tx, ty), 2, color, -1)
 
             cv2.imshow(window, display)
 

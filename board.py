@@ -88,6 +88,155 @@ def get_ring(r):
     return ("miss", 0)
 
 
+def classify_dart(x, y):
+    """Classify a dart with confidence based on proximity to wires.
+
+    Args:
+        x: Canonical pixel x-coordinate (1px ≈ 1mm).
+        y: Canonical pixel y-coordinate.
+
+    Returns:
+        Dict with keys: segment, sector, ring, ring_code, score, label,
+        r, theta, confidence, sector_candidates, ring_candidates,
+        sector_wire_dist_deg, ring_wire_dist_mm.
+
+        confidence is 0.0–1.0 based on distance from nearest wire:
+          - 1.0 = far from any wire (high confidence)
+          - 0.0 = right on a wire (ambiguous)
+    """
+    r, theta = pixel_to_polar(x, y)
+    ring_name, multiplier = get_ring(r)
+    sector = get_sector(theta) if ring_name not in ("D-BULL", "S-BULL", "miss") else 0
+
+    # --- Sector confidence (angular wire proximity) ---
+    # Each sector spans 18°. Wires are at (i*18 - 9)° for i=0..19.
+    # Distance to nearest sector wire:
+    sector_wire_dist = 9.0  # max = center of sector
+    if ring_name not in ("D-BULL", "S-BULL", "miss"):
+        offset = (theta + 9) % 18  # 0-18, where 0 and 18 are wires
+        sector_wire_dist = min(offset, 18 - offset)  # 0-9 degrees
+
+    # --- Ring confidence (radial wire proximity) ---
+    ring_boundaries = [
+        config.INNER_BULL_RADIUS,
+        config.OUTER_BULL_RADIUS,
+        config.TRIPLE_INNER_RADIUS,
+        config.TRIPLE_OUTER_RADIUS,
+        config.DOUBLE_INNER_RADIUS,
+        config.DOUBLE_OUTER_RADIUS,
+    ]
+    ring_wire_dist = min(abs(r - b) for b in ring_boundaries)
+
+    # --- Combined confidence ---
+    # Sector: 9° = fully confident, <2° = low confidence
+    sector_conf = min(sector_wire_dist / 4.0, 1.0)
+    # Ring: >5mm = fully confident, <1.5mm = low confidence
+    ring_conf = min(ring_wire_dist / 3.0, 1.0)
+    confidence = min(sector_conf, ring_conf)
+
+    # --- Sector candidates (when near angular wire) ---
+    sector_candidates = [sector] if sector else []
+    if sector and sector_wire_dist < 4.0:
+        # Find adjacent sectors
+        idx = config.SECTOR_ORDER.index(sector)
+        left = config.SECTOR_ORDER[(idx - 1) % 20]
+        right = config.SECTOR_ORDER[(idx + 1) % 20]
+        # Which side is closer?
+        offset = (theta + 9) % 18
+        if offset < 9:
+            # Closer to the wire on the "left" (clockwise previous)
+            sector_candidates.append(config.SECTOR_ORDER[(idx - 1) % 20])
+        else:
+            sector_candidates.append(config.SECTOR_ORDER[(idx + 1) % 20])
+
+    # --- Ring candidates (when near radial boundary) ---
+    RING_MARGIN = 3.0  # mm
+    ring_candidates = [ring_name]
+    if ring_name == "D-BULL" and abs(r - config.INNER_BULL_RADIUS) < RING_MARGIN:
+        ring_candidates.append("S-BULL")
+    elif ring_name == "S-BULL":
+        if abs(r - config.INNER_BULL_RADIUS) < RING_MARGIN:
+            ring_candidates.append("D-BULL")
+        if abs(r - config.OUTER_BULL_RADIUS) < RING_MARGIN:
+            ring_candidates.append("single")
+    elif ring_name == "single":
+        if abs(r - config.OUTER_BULL_RADIUS) < RING_MARGIN:
+            ring_candidates.append("S-BULL")
+        if abs(r - config.TRIPLE_INNER_RADIUS) < RING_MARGIN:
+            ring_candidates.append("triple")
+        if abs(r - config.DOUBLE_INNER_RADIUS) < RING_MARGIN:
+            ring_candidates.append("double")
+    elif ring_name == "triple":
+        if abs(r - config.TRIPLE_INNER_RADIUS) < RING_MARGIN:
+            ring_candidates.append("single")
+        if abs(r - config.TRIPLE_OUTER_RADIUS) < RING_MARGIN:
+            ring_candidates.append("single")
+    elif ring_name == "double":
+        if abs(r - config.DOUBLE_INNER_RADIUS) < RING_MARGIN:
+            ring_candidates.append("single")
+        if abs(r - config.DOUBLE_OUTER_RADIUS) < RING_MARGIN:
+            ring_candidates.append("miss")
+    elif ring_name == "miss" and abs(r - config.DOUBLE_OUTER_RADIUS) < RING_MARGIN:
+        ring_candidates.append("double")
+
+    # --- Build segment name ---
+    ring_code_map = {"single": "S", "double": "D", "triple": "T"}
+    if ring_name == "D-BULL":
+        segment = "D_BULL"
+        ring_code = "D_BULL"
+        label = "Double Bull → 50"
+        score = 50
+    elif ring_name == "S-BULL":
+        segment = "S_BULL"
+        ring_code = "S_BULL"
+        label = "Single Bull → 25"
+        score = 25
+    elif ring_name == "miss":
+        segment = "MISS"
+        ring_code = "MISS"
+        label = "Miss → 0"
+        score = 0
+    else:
+        ring_code = ring_code_map[ring_name]
+        segment = f"{ring_code}{sector}"
+        score = sector * multiplier
+        label = f"{ring_name.capitalize()} {sector} → {score}"
+
+    return {
+        "segment": segment,
+        "sector": sector,
+        "ring": ring_name,
+        "ring_code": ring_code,
+        "multiplier": multiplier,
+        "score": score,
+        "label": label,
+        "r": r,
+        "theta": theta,
+        "confidence": confidence,
+        "sector_candidates": sector_candidates,
+        "ring_candidates": ring_candidates,
+        "sector_wire_dist_deg": sector_wire_dist,
+        "ring_wire_dist_mm": ring_wire_dist,
+    }
+
+
+def classify_from_camera(point, homography):
+    """Classify a dart from camera pixel coordinates with confidence.
+
+    Args:
+        point: (x, y) tuple in camera pixel space.
+        homography: 3x3 homography matrix.
+
+    Returns:
+        Classification dict as returned by classify_dart, or None on failure.
+    """
+    try:
+        canonical = apply_homography(point, homography)
+        return classify_dart(canonical[0], canonical[1])
+    except Exception:
+        return None
+
+
 def score_dart(x, y):
     """Score a dart given its canonical pixel coordinates.
 

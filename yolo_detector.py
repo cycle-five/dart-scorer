@@ -1,32 +1,105 @@
 """
-yolo_detector.py — YOLO-based dart detection and scoring.
+yolo_detector.py — V2 YOLO dart detection + geometry classification.
 
-Drop-in replacement for detector.py. Uses a trained YOLOv8 model to detect
-dart tips and classify them by ordinal (1st/2nd/3rd) and board segment.
-No homography or board calibration needed.
+Uses a 1-class YOLO model to detect darts, then classifies each dart
+using board geometry (homography → polar → sector/ring).
 """
 
+import math
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 import config
-from classes import ID_TO_CLASS, parse_class_name
+from board import classify_dart, apply_homography
 
 
 RUNS_DIR = config.PROJECT_ROOT / "runs"
-DEFAULT_WEIGHTS = RUNS_DIR / "detect" / "dartscorer" / "weights" / "best.pt"
+DEFAULT_WEIGHTS = RUNS_DIR / "detect" / "dartscorer_v2" / "weights" / "best.pt"
+
+
+def _estimate_tip(bbox, board_center):
+    """Estimate dart tip position from bounding box.
+
+    The tip is the point on the bbox edge closest to the board center,
+    since darts point roughly toward the center.
+
+    Args:
+        bbox: (x1, y1, x2, y2) bounding box.
+        board_center: (cx, cy) board center in pixel coordinates.
+
+    Returns:
+        (tip_x, tip_y) integer pixel coordinates.
+    """
+    x1, y1, x2, y2 = bbox
+    bcx, bcy = board_center
+
+    # Bbox center
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+
+    # Direction from bbox center toward board center
+    dx = bcx - cx
+    dy = bcy - cy
+    dist = math.sqrt(dx * dx + dy * dy)
+    if dist < 1:
+        return int(cx), int(cy)
+
+    dx /= dist
+    dy /= dist
+
+    # Walk from bbox center toward board center until we hit the bbox edge
+    # The tip is the closest edge point to the board center
+    # Find intersection with bbox boundary
+    candidates = []
+
+    # Right/left edge
+    if dx > 0:
+        t = (x2 - cx) / dx if dx != 0 else float('inf')
+    elif dx < 0:
+        t = (x1 - cx) / dx if dx != 0 else float('inf')
+    else:
+        t = float('inf')
+    # Wait — we want to go TOWARD center, not away. The tip is the edge closest
+    # to center. So we go in the direction of (dx, dy) and find the bbox edge.
+    # Actually, the tip IS the part closest to the board center.
+    # Simplest approach: find the bbox corner/edge point closest to board center.
+
+    # Sample points along bbox edges and find closest to board center
+    best_pt = (int(cx), int(cy))
+    best_dist = dist
+
+    # Check midpoints of each edge + corners
+    edge_points = [
+        ((x1 + x2) / 2, y1),  # top mid
+        ((x1 + x2) / 2, y2),  # bottom mid
+        (x1, (y1 + y2) / 2),  # left mid
+        (x2, (y1 + y2) / 2),  # right mid
+        (x1, y1), (x2, y1),   # top corners
+        (x1, y2), (x2, y2),   # bottom corners
+    ]
+
+    for px, py in edge_points:
+        d = math.sqrt((px - bcx) ** 2 + (py - bcy) ** 2)
+        if d < best_dist:
+            best_dist = d
+            best_pt = (int(px), int(py))
+
+    return best_pt
 
 
 class YOLODartDetector:
-    def __init__(self, weights=None, conf=0.25, iou=0.45, device=None):
+    def __init__(self, weights=None, conf=0.25, iou=0.45, device=None,
+                 homography=None, crop_offset=(0, 0)):
         """
         Args:
-            weights: Path to YOLO weights file. Defaults to best.pt from training.
+            weights: Path to YOLO weights file (1-class model).
             conf: Confidence threshold for detections.
             iou: IoU threshold for NMS.
             device: Inference device ('cpu', '0', etc).
+            homography: 3x3 numpy array for board homography.
+            crop_offset: (x, y) offset from crop ROI to full frame.
         """
         from ultralytics import YOLO
 
@@ -34,32 +107,50 @@ class YOLODartDetector:
         if not Path(weights).exists():
             raise FileNotFoundError(
                 f"YOLO weights not found at {weights}.\n"
-                "Run 'python train.py' first to train a model."
+                "Run 'python train.py' or check runs/detect/dartscorer_v2/"
             )
 
         self.model = YOLO(str(weights))
         self.conf = conf
         self.iou = iou
         self.device = device
+        self.homography = homography
+        self.crop_offset = crop_offset
+
+        # Board center in crop-pixel space (for tip estimation)
+        self.board_center = None
+        if homography is not None:
+            try:
+                H_inv = np.linalg.inv(homography)
+                cx, cy = config.CANONICAL_CENTER
+                pts = np.array([[[cx, cy]]], dtype=np.float32)
+                transformed = cv2.perspectiveTransform(pts, H_inv)
+                bcx = float(transformed[0][0][0]) - crop_offset[0]
+                bcy = float(transformed[0][0][1]) - crop_offset[1]
+                self.board_center = (bcx, bcy)
+            except Exception:
+                pass
 
         # Track confirmed darts in current round
-        self.confirmed_darts = {}  # ordinal -> detection dict
+        self.confirmed_darts = {}  # ordinal (1-3) -> detection dict
         self.round_dart_count = 0
 
     def process_frame(self, frame):
-        """Run YOLO inference on a frame.
+        """Run YOLO inference + geometry classification on a frame.
 
         Args:
-            frame: BGR uint8 image from camera.
+            frame: BGR uint8 image (cropped).
 
         Returns:
             List of detection dicts, each with:
-                tip: (x, y) center of bounding box
+                tip: (x, y) estimated tip position
                 bbox: (x1, y1, x2, y2)
-                class_name: e.g. "d1_T20"
-                class_id: integer class index
-                confidence: float 0-1
-                score_info: parsed score dict from classes.parse_class_name
+                yolo_confidence: YOLO detection confidence
+                classification: dict from board.classify_dart (or None)
+                segment: segment name (e.g., "T20") or "unknown"
+                score: point value
+                label: human-readable label
+                confidence: geometry confidence (0-1)
         """
         results = self.model.predict(
             frame,
@@ -78,23 +169,45 @@ class YOLODartDetector:
             return detections
 
         for box in result.boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
+            yolo_conf = float(box.conf[0])
             x1, y1, x2, y2 = box.xyxy[0].tolist()
+            bbox = (int(x1), int(y1), int(x2), int(y2))
 
-            class_name = ID_TO_CLASS.get(cls_id, f"unknown_{cls_id}")
-            score_info = parse_class_name(class_name)
+            # Estimate tip position
+            if self.board_center is not None:
+                tip = _estimate_tip(bbox, self.board_center)
+            else:
+                tip = (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-            tip_x = int((x1 + x2) / 2)
-            tip_y = int((y1 + y2) / 2)
+            # Geometry classification
+            classification = None
+            segment = "unknown"
+            score = 0
+            label = "Unknown"
+            geo_confidence = 0.0
+
+            if self.homography is not None:
+                tip_full = (tip[0] + self.crop_offset[0],
+                            tip[1] + self.crop_offset[1])
+                try:
+                    can = apply_homography(tip_full, self.homography)
+                    classification = classify_dart(can[0], can[1])
+                    segment = classification["segment"]
+                    score = classification["score"]
+                    label = classification["label"]
+                    geo_confidence = classification["confidence"]
+                except Exception:
+                    pass
 
             detections.append({
-                "tip": (tip_x, tip_y),
-                "bbox": (int(x1), int(y1), int(x2), int(y2)),
-                "class_name": class_name,
-                "class_id": cls_id,
-                "confidence": conf,
-                "score_info": score_info,
+                "tip": tip,
+                "bbox": bbox,
+                "yolo_confidence": yolo_conf,
+                "classification": classification,
+                "segment": segment,
+                "score": score,
+                "label": label,
+                "confidence": geo_confidence,
             })
 
         return detections
@@ -102,8 +215,12 @@ class YOLODartDetector:
     def get_new_darts(self, detections):
         """Filter detections to find newly thrown darts.
 
-        Compares current detections against previously confirmed darts
-        and returns only new ones (higher ordinal than what's already known).
+        Uses detection count: if YOLO sees more darts than we've confirmed,
+        the extras are new. This works even when darts are in a tight cluster
+        (a few pixels apart) where proximity matching would fail.
+
+        To identify WHICH detections are new, we match confirmed darts to
+        their nearest detection and return the unmatched ones.
 
         Args:
             detections: List from process_frame().
@@ -111,18 +228,44 @@ class YOLODartDetector:
         Returns:
             List of new detection dicts (subset of input).
         """
-        new = []
-        for det in detections:
-            ordinal = det["score_info"]["ordinal"]
-            if ordinal not in self.confirmed_darts:
-                new.append(det)
-        return new
+        if len(detections) <= self.round_dart_count:
+            return []  # no new darts (same or fewer than confirmed)
+
+        if self.round_dart_count == 0:
+            # No confirmed darts yet — all detections are new
+            return list(detections)
+
+        # Match each confirmed dart to its nearest detection (greedy)
+        import math
+        matched_indices = set()
+        for confirmed in self.confirmed_darts.values():
+            cx, cy = confirmed["tip"]
+            best_idx = None
+            best_dist = float('inf')
+            for i, det in enumerate(detections):
+                if i in matched_indices:
+                    continue
+                tx, ty = det["tip"]
+                d = math.sqrt((tx - cx) ** 2 + (ty - cy) ** 2)
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+            if best_idx is not None:
+                matched_indices.add(best_idx)
+
+        # Unmatched detections are new darts
+        return [det for i, det in enumerate(detections)
+                if i not in matched_indices]
 
     def confirm_dart(self, detection):
-        """Mark a detection as a confirmed dart in this round."""
-        ordinal = detection["score_info"]["ordinal"]
+        """Mark a detection as a confirmed dart in this round.
+
+        Assigns the next ordinal (1, 2, or 3).
+        """
+        ordinal = self.round_dart_count + 1
+        detection["ordinal"] = ordinal
         self.confirmed_darts[ordinal] = detection
-        self.round_dart_count = len(self.confirmed_darts)
+        self.round_dart_count = ordinal
 
     def reset(self):
         """Reset for a new round (darts pulled from board)."""
@@ -130,24 +273,50 @@ class YOLODartDetector:
         self.round_dart_count = 0
 
     def get_debug_frame(self, frame, detections):
-        """Annotate frame with detection boxes and labels."""
+        """Annotate frame with detection boxes, tips, and classifications."""
         out = frame.copy()
+
+        # Draw board center
+        if self.board_center is not None:
+            bcx, bcy = int(self.board_center[0]), int(self.board_center[1])
+            cv2.drawMarker(out, (bcx, bcy), (255, 0, 255),
+                          cv2.MARKER_CROSS, 20, 1)
+
         for det in detections:
             x1, y1, x2, y2 = det["bbox"]
-            conf = det["confidence"]
-            info = det["score_info"]
-            label = f"d{info['ordinal']} {info['label']} ({conf:.2f})"
+            conf = det["yolo_confidence"]
+            geo_conf = det["confidence"]
+            segment = det["segment"]
+            label_text = f"{segment} ({conf:.0%})"
+            if geo_conf < 0.5:
+                label_text += " ?"
 
-            # Color by ordinal
-            colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
-            color = colors.get(info["ordinal"], (255, 255, 255))
+            # Color by geometry confidence
+            if geo_conf > 0.75:
+                color = (0, 255, 0)    # green — confident
+            elif geo_conf > 0.4:
+                color = (0, 255, 255)  # yellow — moderate
+            else:
+                color = (0, 0, 255)    # red — ambiguous
 
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(out, label, (x1, y1 - 8),
+            cv2.putText(out, label_text, (x1, y1 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
             # Tip marker
             tx, ty = det["tip"]
             cv2.circle(out, (tx, ty), 4, color, -1)
+
+            # Score text
+            if det["score"] > 0:
+                cv2.putText(out, str(det["score"]), (tx + 8, ty - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        # Draw confirmed darts
+        for ordinal, dart in self.confirmed_darts.items():
+            tx, ty = dart["tip"]
+            colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
+            color = colors.get(ordinal, (255, 255, 255))
+            cv2.circle(out, (tx, ty), 8, color, 2)
 
         return out
