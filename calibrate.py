@@ -277,8 +277,8 @@ def _compute_canonical_destinations(scale_factor=1.0):
     cx, cy = config.CANONICAL_CENTER   # (170, 170)
     r = config.DOUBLE_OUTER_RADIUS     # 170
     destinations = [(float(cx), float(cy))]  # bullseye center
-    for i in range(20):
-        angle = i * 18.0  # sector midpoint (center of sector number)
+    for i in range(config.NUM_SECTORS):
+        angle = i * config.SECTOR_SPAN_DEG  # sector midpoint (center of sector number)
         x = cx + (r * scale_factor) * math.sin(math.radians(angle))
         y = cy - (r * scale_factor) * math.cos(math.radians(angle))
         destinations.append((x, y))

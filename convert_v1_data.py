@@ -46,13 +46,13 @@ V2_IMAGES = V2_DIR / "images"
 V2_LABELS = V2_DIR / "labels"
 V2_META = V2_DIR / "metadata"
 
-# Auto-expand parameters
-# Darts point roughly toward the board center. We extend the bounding box
-# along the radial direction (away from center) to capture shaft + flights.
-EXPAND_AWAY_PX = 80    # pixels away from center (shaft direction)
-EXPAND_TOWARD_PX = 15  # pixels toward center (tip margin)
-EXPAND_LATERAL_PX = 25 # pixels perpendicular to radial axis
-MIN_BOX_PX = 60        # minimum box side in pixels (at 1080p)
+# Auto-expand parameters — resolved at call time from config fractions.
+# Module-level aliases kept for backward compat with existing calls;
+# auto_expand_bbox() recomputes per-image below.
+EXPAND_AWAY_PX = 80    # fallback, overridden per-image
+EXPAND_TOWARD_PX = 15
+EXPAND_LATERAL_PX = 25
+MIN_BOX_PX = 60
 
 
 def load_homography():
@@ -87,6 +87,12 @@ def auto_expand_bbox(tip_x, tip_y, img_w, img_h, board_center=None):
     Returns:
         (cx, cy, w, h) normalized bounding box [0, 1].
     """
+    # Resolve expansion constants from resolution-relative fractions
+    expand_away = int(round(config.BBOX_EXPAND_AWAY_FRAC * img_w))
+    expand_toward = int(round(config.BBOX_EXPAND_TOWARD_FRAC * img_w))
+    expand_lateral = int(round(config.BBOX_EXPAND_LATERAL_FRAC * img_h))
+    min_box = int(round(config.BBOX_MIN_SIZE_FRAC * img_w))
+
     if board_center is not None:
         bcx, bcy = board_center
         # Direction from tip toward center (the way the dart points)
@@ -119,18 +125,18 @@ def auto_expand_bbox(tip_x, tip_y, img_w, img_h, board_center=None):
     corners_y = []
 
     # Toward center (past tip, small margin)
-    corners_x.append(tip_x + dx * EXPAND_TOWARD_PX)
-    corners_y.append(tip_y + dy * EXPAND_TOWARD_PX)
+    corners_x.append(tip_x + dx * expand_toward)
+    corners_y.append(tip_y + dy * expand_toward)
 
     # Away from center (shaft + flights)
-    corners_x.append(tip_x - dx * EXPAND_AWAY_PX)
-    corners_y.append(tip_y - dy * EXPAND_AWAY_PX)
+    corners_x.append(tip_x - dx * expand_away)
+    corners_y.append(tip_y - dy * expand_away)
 
     # Lateral (perpendicular, both sides)
-    corners_x.append(tip_x + perp_x * EXPAND_LATERAL_PX)
-    corners_y.append(tip_y + perp_y * EXPAND_LATERAL_PX)
-    corners_x.append(tip_x - perp_x * EXPAND_LATERAL_PX)
-    corners_y.append(tip_y - perp_y * EXPAND_LATERAL_PX)
+    corners_x.append(tip_x + perp_x * expand_lateral)
+    corners_y.append(tip_y + perp_y * expand_lateral)
+    corners_x.append(tip_x - perp_x * expand_lateral)
+    corners_y.append(tip_y - perp_y * expand_lateral)
 
     # Axis-aligned bounding box from corners
     x1 = max(0, min(corners_x))
@@ -141,12 +147,12 @@ def auto_expand_bbox(tip_x, tip_y, img_w, img_h, board_center=None):
     # Enforce minimum size
     box_w = x2 - x1
     box_h = y2 - y1
-    if box_w < MIN_BOX_PX:
-        pad = (MIN_BOX_PX - box_w) / 2
+    if box_w < min_box:
+        pad = (min_box - box_w) / 2
         x1 = max(0, x1 - pad)
         x2 = min(img_w, x2 + pad)
-    if box_h < MIN_BOX_PX:
-        pad = (MIN_BOX_PX - box_h) / 2
+    if box_h < min_box:
+        pad = (min_box - box_h) / 2
         y1 = max(0, y1 - pad)
         y2 = min(img_h, y2 + pad)
 
@@ -200,7 +206,7 @@ def sector_distance(s1, s2):
     except ValueError:
         return 99  # bulls or miss
     d = abs(i1 - i2)
-    return min(d, 20 - d)
+    return min(d, config.NUM_SECTORS - d)
 
 
 # ---------------------------------------------------------------------------

@@ -58,9 +58,9 @@ def get_sector(theta):
     Returns:
         Integer sector number (1–20).
     """
-    # Each sector spans 18°. Adding 9° offsets so sector 20 (centred at 0°)
-    # covers 351°–9°.
-    sector_index = int((theta + 9) % 360 / 18)
+    # Each sector spans SECTOR_SPAN_DEG. Adding SECTOR_BOUNDARY_OFFSET
+    # so sector 20 (centred at 0°) covers 351°–9°.
+    sector_index = int((theta + config.SECTOR_BOUNDARY_OFFSET) % 360 / config.SECTOR_SPAN_DEG)
     return config.SECTOR_ORDER[sector_index]
 
 
@@ -108,13 +108,16 @@ def classify_dart(x, y):
     ring_name, multiplier = get_ring(r)
     sector = get_sector(theta) if ring_name not in ("D-BULL", "S-BULL", "miss") else 0
 
-    # --- Sector confidence (angular wire proximity) ---
-    # Each sector spans 18°. Wires are at (i*18 - 9)° for i=0..19.
-    # Distance to nearest sector wire:
-    sector_wire_dist = 9.0  # max = center of sector
+    # --- Sector confidence (arc-length wire proximity) ---
+    # Each sector spans SECTOR_SPAN_DEG. Distance to nearest sector wire
+    # is converted to arc length (mm) at the dart's radius so that sector
+    # and ring confidence are in the same physical units.
+    sector_wire_dist = config.SECTOR_BOUNDARY_OFFSET  # max = center of sector (degrees)
+    sector_wire_arc_mm = float('inf')  # arc-length in mm
     if ring_name not in ("D-BULL", "S-BULL", "miss"):
-        offset = (theta + 9) % 18  # 0-18, where 0 and 18 are wires
-        sector_wire_dist = min(offset, 18 - offset)  # 0-9 degrees
+        offset = (theta + config.SECTOR_BOUNDARY_OFFSET) % config.SECTOR_SPAN_DEG
+        sector_wire_dist = min(offset, config.SECTOR_SPAN_DEG - offset)
+        sector_wire_arc_mm = r * math.radians(sector_wire_dist)
 
     # --- Ring confidence (radial wire proximity) ---
     ring_boundaries = [
@@ -128,29 +131,29 @@ def classify_dart(x, y):
     ring_wire_dist = min(abs(r - b) for b in ring_boundaries)
 
     # --- Combined confidence ---
-    # Sector: 9° = fully confident, <2° = low confidence
-    sector_conf = min(sector_wire_dist / 4.0, 1.0)
-    # Ring: >5mm = fully confident, <1.5mm = low confidence
-    ring_conf = min(ring_wire_dist / 3.0, 1.0)
+    # Both sector and ring use mm-from-wire with the same divisor.
+    # Wire width is ~1.6mm; at WIRE_CONF_DIVISOR_MM the confidence is 1.0.
+    sector_conf = min(sector_wire_arc_mm / config.WIRE_CONF_DIVISOR_MM, 1.0)
+    ring_conf = min(ring_wire_dist / config.WIRE_CONF_DIVISOR_MM, 1.0)
     confidence = min(sector_conf, ring_conf)
 
     # --- Sector candidates (when near angular wire) ---
     sector_candidates = [sector] if sector else []
-    if sector and sector_wire_dist < 4.0:
+    if sector and sector_wire_arc_mm < config.WIRE_AMBIGUITY_THRESHOLD_MM:
         # Find adjacent sectors
         idx = config.SECTOR_ORDER.index(sector)
-        left = config.SECTOR_ORDER[(idx - 1) % 20]
-        right = config.SECTOR_ORDER[(idx + 1) % 20]
+        left = config.SECTOR_ORDER[(idx - 1) % config.NUM_SECTORS]
+        right = config.SECTOR_ORDER[(idx + 1) % config.NUM_SECTORS]
         # Which side is closer?
-        offset = (theta + 9) % 18
-        if offset < 9:
+        offset = (theta + config.SECTOR_BOUNDARY_OFFSET) % config.SECTOR_SPAN_DEG
+        if offset < config.SECTOR_BOUNDARY_OFFSET:
             # Closer to the wire on the "left" (clockwise previous)
-            sector_candidates.append(config.SECTOR_ORDER[(idx - 1) % 20])
+            sector_candidates.append(config.SECTOR_ORDER[(idx - 1) % config.NUM_SECTORS])
         else:
-            sector_candidates.append(config.SECTOR_ORDER[(idx + 1) % 20])
+            sector_candidates.append(config.SECTOR_ORDER[(idx + 1) % config.NUM_SECTORS])
 
     # --- Ring candidates (when near radial boundary) ---
-    RING_MARGIN = 3.0  # mm
+    RING_MARGIN = config.RING_MARGIN_MM
     ring_candidates = [ring_name]
     if ring_name == "D-BULL" and abs(r - config.INNER_BULL_RADIUS) < RING_MARGIN:
         ring_candidates.append("S-BULL")
@@ -367,8 +370,8 @@ def draw_board_overlay(img, alpha=0.3):
 
     # --- Sector dividing lines ---
     line_length = config.DOUBLE_OUTER_RADIUS
-    for i in range(20):
-        boundary_deg = (i * 18 - 9) % 360
+    for i in range(config.NUM_SECTORS):
+        boundary_deg = (i * config.SECTOR_SPAN_DEG - config.SECTOR_BOUNDARY_OFFSET) % 360
         boundary_rad = math.radians(boundary_deg)
         end_x = int(round(cx + line_length * math.sin(boundary_rad)))
         end_y = int(round(cy - line_length * math.cos(boundary_rad)))
@@ -377,7 +380,7 @@ def draw_board_overlay(img, alpha=0.3):
     # --- Sector number labels ---
     label_r = config.DOUBLE_OUTER_RADIUS + 8  # just outside the board
     for i, sector_num in enumerate(config.SECTOR_ORDER):
-        angle_deg = i * 18  # center of each sector
+        angle_deg = i * config.SECTOR_SPAN_DEG  # center of each sector
         angle_rad = math.radians(angle_deg)
         lx = int(round(cx + label_r * math.sin(angle_rad)))
         ly = int(round(cy - label_r * math.cos(angle_rad)))

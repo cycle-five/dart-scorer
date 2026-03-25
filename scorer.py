@@ -105,8 +105,8 @@ def main():
                        help="Game mode (301 or 501)")
     parser.add_argument("--debug", action="store_true",
                        help="Show detection details and bboxes")
-    parser.add_argument("--conf", type=float, default=0.25,
-                       help="YOLO confidence threshold (default: 0.25)")
+    parser.add_argument("--conf", type=float, default=config.YOLO_DEFAULT_CONF,
+                       help=f"YOLO confidence threshold (default: {config.YOLO_DEFAULT_CONF})")
     parser.add_argument("--weights", type=str, default=None,
                        help="Path to YOLO weights file")
     parser.add_argument("--no-undistort", action="store_true",
@@ -177,7 +177,7 @@ def main():
     state = State.WAITING
     last_score_label = None
     empty_frames = 0
-    REMOVAL_THRESHOLD = 10
+    REMOVAL_THRESHOLD = config.EMPTY_FRAME_REMOVAL_THRESHOLD
 
     window = "Dart Scorer v2"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
@@ -218,9 +218,9 @@ def main():
 
                     # Confidence indicator
                     conf_marker = ""
-                    if geo_conf < 0.4:
+                    if geo_conf < config.GEO_CONF_MODERATE:
                         conf_marker = " [?]"
-                    elif geo_conf < 0.75:
+                    elif geo_conf < config.GEO_CONF_HIGH:
                         conf_marker = " [~]"
 
                     last_score_label = f"dart {ordinal}: {label}{conf_marker}"
@@ -293,8 +293,7 @@ def main():
             if not args.debug:
                 for ordinal, dart in detector.confirmed_darts.items():
                     tx, ty = dart["tip"]
-                    colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
-                    color = colors.get(ordinal, (255, 255, 255))
+                    color = config.DART_ORDINAL_COLORS.get(ordinal, (255, 255, 255))
                     cv2.circle(display, (tx, ty), 8, color, 2)
                     cv2.circle(display, (tx, ty), 2, color, -1)
 

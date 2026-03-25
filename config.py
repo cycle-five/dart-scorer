@@ -6,6 +6,7 @@ containing this file) so the project can be run from any working directory.
 """
 
 import os
+import cv2
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,87 @@ CANONICAL_CENTER = (170, 170)  # (x, y) pixels
 SECTOR_ORDER = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
 
 # ---------------------------------------------------------------------------
+# Board geometry (derived constants)
+# ---------------------------------------------------------------------------
+
+# A standard dartboard has 20 sectors, each spanning 18° (360/20).
+NUM_SECTORS = 20
+SECTOR_SPAN_DEG = 360.0 / NUM_SECTORS       # 18°
+SECTOR_BOUNDARY_OFFSET = SECTOR_SPAN_DEG / 2  # 9° — half-sector for boundary alignment
+
+# ---------------------------------------------------------------------------
+# Bounding box expansion (auto_expand_bbox)
+# ---------------------------------------------------------------------------
+
+# Resolution-relative fractions for expanding a tip coordinate to a full-dart
+# bounding box. Expressed as fractions of frame width (or height for lateral),
+# calibrated at 1371x1080 where 80/15/25/60 px worked well.
+BBOX_EXPAND_AWAY_FRAC = 0.0584     # fraction of frame width (shaft + flights)
+BBOX_EXPAND_TOWARD_FRAC = 0.0109   # fraction of frame width (tip margin)
+BBOX_EXPAND_LATERAL_FRAC = 0.0231  # fraction of frame height (perpendicular)
+BBOX_MIN_SIZE_FRAC = 0.0438        # fraction of frame width (minimum box side)
+
+# ---------------------------------------------------------------------------
+# Classification confidence
+# ---------------------------------------------------------------------------
+
+# Wire proximity model — both sector and ring confidence use physical
+# distance in mm from the nearest wire.  Sector angular distance is
+# converted to arc length at the dart's radius so both axes are in the
+# same units.  Wire width is ~1.6mm (SWB standard).
+RING_MARGIN_MM = 3.0                # mm — ring boundary tolerance for candidates
+WIRE_CONF_DIVISOR_MM = 3.0          # mm — confidence = min(dist / divisor, 1.0)
+WIRE_AMBIGUITY_THRESHOLD_MM = 3.0   # mm — arc-length threshold for sector candidates
+
+# Geo-confidence thresholds used for display markers and debug color-coding.
+GEO_CONF_HIGH = 0.75    # above this: confident (green)
+GEO_CONF_MODERATE = 0.4  # above this: moderate (yellow), below: ambiguous (red)
+
+# ---------------------------------------------------------------------------
+# YOLO defaults
+# ---------------------------------------------------------------------------
+
+YOLO_DEFAULT_CONF = 0.25    # detection confidence threshold
+YOLO_DEFAULT_IOU = 0.45     # NMS IoU threshold
+
+# ---------------------------------------------------------------------------
+# Scorer state machine
+# ---------------------------------------------------------------------------
+
+# Number of consecutive empty frames before darts are considered removed
+EMPTY_FRAME_REMOVAL_THRESHOLD = 10
+
+# BGR color for each dart ordinal (1st, 2nd, 3rd)
+DART_ORDINAL_COLORS = {
+    1: (0, 255, 0),      # green
+    2: (0, 255, 255),    # yellow
+    3: (0, 0, 255),      # red
+}
+
+# ---------------------------------------------------------------------------
+# Video trigger
+# ---------------------------------------------------------------------------
+
+VIDEO_TRIGGER_THUMB_SIZE = (160, 120)   # downsampled frame size
+VIDEO_TRIGGER_CELL_THRESHOLD = 15       # per-pixel diff threshold
+VIDEO_TRIGGER_SUPPRESS_CALM = 15        # calm frames to exit PULL_DARTS
+VIDEO_TRIGGER_COOLDOWN = 1.5            # seconds between triggers
+VIDEO_TRIGGER_WARMUP = 5.0              # warmup period in seconds
+VIDEO_TRIGGER_HISTORY_MAX = 200         # rolling diff history buffer
+
+# ---------------------------------------------------------------------------
+# Homography guessing tolerances (collect.py annotation helper)
+# ---------------------------------------------------------------------------
+
+# Generous radial tolerances (mm) for segment guessing from click position.
+# Clicking precision at ring boundaries is inherently imprecise.
+GUESS_BULL_TOLERANCE = 2       # mm added to bull radii
+GUESS_TRIPLE_TOLERANCE = 5     # mm tolerance around triple ring
+GUESS_DOUBLE_TOLERANCE_INNER = 5   # mm inside double ring
+GUESS_DOUBLE_TOLERANCE_OUTER = 10  # mm outside double ring
+GUESS_MISS_TOLERANCE = 10      # mm beyond double outer = miss
+
+# ---------------------------------------------------------------------------
 # Detection constants
 # ---------------------------------------------------------------------------
 
@@ -189,3 +271,9 @@ LOG_FILE = PROJECT_ROOT / "data" / "detections.csv"
 # Set to True to enable verbose console output, intermediate frame windows,
 # and other developer aids.  Keep False in production.
 DEBUG = True
+
+# ---------------------------------------------------------------------------
+# Fonts
+# ---------------------------------------------------------------------------
+# Path to the TTF font file used for rendering text overlays on frames.
+DEFAULT_FONT = cv2.FONT_HERSHEY_SIMPLEX

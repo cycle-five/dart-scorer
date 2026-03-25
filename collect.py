@@ -60,10 +60,10 @@ def auto_expand_bbox(tip_x, tip_y, img_w, img_h, board_center=None):
     """
     import math
 
-    EXPAND_AWAY = 80    # pixels away from center (shaft)
-    EXPAND_TOWARD = 15  # pixels toward center (tip margin)
-    EXPAND_LATERAL = 25 # pixels perpendicular
-    MIN_BOX = 60        # minimum box side
+    EXPAND_AWAY = int(round(config.BBOX_EXPAND_AWAY_FRAC * img_w))
+    EXPAND_TOWARD = int(round(config.BBOX_EXPAND_TOWARD_FRAC * img_w))
+    EXPAND_LATERAL = int(round(config.BBOX_EXPAND_LATERAL_FRAC * img_h))
+    MIN_BOX = int(round(config.BBOX_MIN_SIZE_FRAC * img_w))
 
     if board_center is not None:
         bcx, bcy = board_center
@@ -163,11 +163,12 @@ class UIState(Enum):
 class VideoTrigger:
     """Detects darts by frame differencing on heavily downsampled frames."""
 
-    THUMB_SIZE = (160, 120)
-    CELL_THRESHOLD = 15
-    SUPPRESS_CALM_REQUIRED = 15
+    THUMB_SIZE = config.VIDEO_TRIGGER_THUMB_SIZE
+    CELL_THRESHOLD = config.VIDEO_TRIGGER_CELL_THRESHOLD
+    SUPPRESS_CALM_REQUIRED = config.VIDEO_TRIGGER_SUPPRESS_CALM
 
-    def __init__(self, threshold=5, cooldown=1.5, warmup_seconds=5.0):
+    def __init__(self, threshold=5, cooldown=config.VIDEO_TRIGGER_COOLDOWN,
+                 warmup_seconds=config.VIDEO_TRIGGER_WARMUP):
         self.threshold = threshold
         self.cooldown = cooldown
         self.warmup_seconds = warmup_seconds
@@ -179,7 +180,7 @@ class VideoTrigger:
         self._baseline_diff = 0.0
         self._raw_changed = 0
         self._diff_history = []
-        self._history_max = 200
+        self._history_max = config.VIDEO_TRIGGER_HISTORY_MAX
         self._suppress_calm_count = 0
         self._saw_pull_disturbance = False
 
@@ -367,15 +368,15 @@ def _guess_segment_from_homography(x, y, homography, crop_offset=(0, 0)):
 
         # Use radius to determine ring, with generous tolerance
         # (clicking precision at the outer wire is inherently imprecise)
-        if r < config.INNER_BULL_RADIUS + 2:
+        if r < config.INNER_BULL_RADIUS + config.GUESS_BULL_TOLERANCE:
             return "D_BULL"
-        elif r < config.OUTER_BULL_RADIUS + 2:
+        elif r < config.OUTER_BULL_RADIUS + config.GUESS_BULL_TOLERANCE:
             return "S_BULL"
-        elif config.TRIPLE_INNER_RADIUS - 5 < r < config.TRIPLE_OUTER_RADIUS + 5:
+        elif config.TRIPLE_INNER_RADIUS - config.GUESS_TRIPLE_TOLERANCE < r < config.TRIPLE_OUTER_RADIUS + config.GUESS_TRIPLE_TOLERANCE:
             return f"T{sector}"
-        elif config.DOUBLE_INNER_RADIUS - 5 < r < config.DOUBLE_OUTER_RADIUS + 10:
+        elif config.DOUBLE_INNER_RADIUS - config.GUESS_DOUBLE_TOLERANCE_INNER < r < config.DOUBLE_OUTER_RADIUS + config.GUESS_DOUBLE_TOLERANCE_OUTER:
             return f"D{sector}"
-        elif r > config.DOUBLE_OUTER_RADIUS + 10:
+        elif r > config.DOUBLE_OUTER_RADIUS + config.GUESS_MISS_TOLERANCE:
             return "MISS"
         else:
             return f"S{sector}"

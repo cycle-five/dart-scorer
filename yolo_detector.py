@@ -127,7 +127,8 @@ def _estimate_tip(bbox, board_center):
 
 
 class YOLODartDetector:
-    def __init__(self, weights=None, conf=0.25, iou=0.45, device=None,
+    def __init__(self, weights=None, conf=config.YOLO_DEFAULT_CONF,
+                 iou=config.YOLO_DEFAULT_IOU, device=None,
                  homography=None, crop_offset=(0, 0)):
         """
         Args:
@@ -325,13 +326,13 @@ class YOLODartDetector:
             geo_conf = det["confidence"]
             segment = det["segment"]
             label_text = f"{segment} ({conf:.0%})"
-            if geo_conf < 0.5:
+            if geo_conf < config.GEO_CONF_MODERATE + 0.1:
                 label_text += " ?"
 
             # Color by geometry confidence
-            if geo_conf > 0.75:
+            if geo_conf > config.GEO_CONF_HIGH:
                 color = (0, 255, 0)    # green — confident
-            elif geo_conf > 0.4:
+            elif geo_conf > config.GEO_CONF_MODERATE:
                 color = (0, 255, 255)  # yellow — moderate
             else:
                 color = (0, 0, 255)    # red — ambiguous
@@ -352,8 +353,7 @@ class YOLODartDetector:
         # Draw confirmed darts
         for ordinal, dart in self.confirmed_darts.items():
             tx, ty = dart["tip"]
-            colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
-            color = colors.get(ordinal, (255, 255, 255))
+            color = config.DART_ORDINAL_COLORS.get(ordinal, (255, 255, 255))
             cv2.circle(out, (tx, ty), 8, color, 2)
 
         return out
