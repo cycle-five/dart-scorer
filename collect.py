@@ -33,14 +33,110 @@ import cv2
 import numpy as np
 import config
 import board
-from classes import (
+from classes_v2 import (
     CLASS_TO_ID,
+    CLASS_NAMES,
+    NUM_CLASSES,
     make_class_name,
     segment_shorthand,
     parse_class_name,
+    ring_from_segment,
+    sector_from_segment,
 )
 from audio_trigger import DartAudioTrigger
 from window_manager import create_window, save_window_sizes
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+
+def auto_expand_bbox(tip_x, tip_y, img_w, img_h, board_center=None):
+    """Expand a tip click to a full-dart bounding box.
+
+    Extends along the radial direction (away from board center) to capture
+    the dart shaft. Returns (cx, cy, w, h) in normalized [0,1] coordinates.
+    """
+    import math
+
+    EXPAND_AWAY = 80    # pixels away from center (shaft)
+    EXPAND_TOWARD = 15  # pixels toward center (tip margin)
+    EXPAND_LATERAL = 25 # pixels perpendicular
+    MIN_BOX = 60        # minimum box side
+
+    if board_center is not None:
+        bcx, bcy = board_center
+        dx = bcx - tip_x
+        dy = bcy - tip_y
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist > 1:
+            dx /= dist; dy /= dist
+        else:
+            dx, dy = 0, -1
+    else:
+        dx = img_w / 2 - tip_x
+        dy = img_h / 2 - tip_y
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist > 1:
+            dx /= dist; dy /= dist
+        else:
+            dx, dy = 0, -1
+
+    perp_x, perp_y = -dy, dx
+
+    corners_x = [
+        tip_x + dx * EXPAND_TOWARD,
+        tip_x - dx * EXPAND_AWAY,
+        tip_x + perp_x * EXPAND_LATERAL,
+        tip_x - perp_x * EXPAND_LATERAL,
+    ]
+    corners_y = [
+        tip_y + dy * EXPAND_TOWARD,
+        tip_y - dy * EXPAND_AWAY,
+        tip_y + perp_y * EXPAND_LATERAL,
+        tip_y - perp_y * EXPAND_LATERAL,
+    ]
+
+    x1 = max(0, min(corners_x))
+    y1 = max(0, min(corners_y))
+    x2 = min(img_w, max(corners_x))
+    y2 = min(img_h, max(corners_y))
+
+    if x2 - x1 < MIN_BOX:
+        pad = (MIN_BOX - (x2 - x1)) / 2
+        x1 = max(0, x1 - pad); x2 = min(img_w, x2 + pad)
+    if y2 - y1 < MIN_BOX:
+        pad = (MIN_BOX - (y2 - y1)) / 2
+        y1 = max(0, y1 - pad); y2 = min(img_h, y2 + pad)
+
+    return (x1 + x2) / (2 * img_w), (y1 + y2) / (2 * img_h), (x2 - x1) / img_w, (y2 - y1) / img_h
+
+
+def geometry_classify(tip_x, tip_y, homography, crop_offset=(0, 0)):
+    """Classify a dart tip using board geometry.
+
+    Returns segment name (e.g., "T20", "S_BULL", "MISS") or None on failure.
+    """
+    try:
+        full_x = tip_x + crop_offset[0]
+        full_y = tip_y + crop_offset[1]
+        can_x, can_y = board.apply_homography((full_x, full_y), homography)
+        r, theta = board.pixel_to_polar(can_x, can_y)
+        ring_name, _ = board.get_ring(r)
+
+        if ring_name == "D-BULL":
+            return "D_BULL"
+        if ring_name == "S-BULL":
+            return "S_BULL"
+        if ring_name == "miss":
+            return "MISS"
+
+        sector = board.get_sector(theta)
+        ring_code = {"single": "S", "double": "D", "triple": "T"}[ring_name]
+        return f"{ring_code}{sector}"
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -170,35 +266,35 @@ class AnnotationSession:
         self,
         homography=None,
         previous_annotations=None,
-        start_ordinal=1,
         crop_offset=(0, 0),
     ):
         self.homography = homography
         self.crop_offset = crop_offset
         self.annotations = list(previous_annotations or [])
-        self.dart_ordinal = start_ordinal
         self.click_point = None
         self.text_input = ""
         self.guess_segment = ""
         self.last_auto_msg = ""
         self._carry_count = len(previous_annotations or [])
 
+    @property
+    def dart_ordinal(self):
+        """1-based index of next dart to annotate (for HUD display)."""
+        return len(self.annotations) + 1
+
     def handle_click(self, x, y):
         """Process a click. Auto-confirms if homography provides a guess."""
         guess = _guess_segment_from_homography(x, y, self.homography, self.crop_offset)
-        if guess:
+        if guess and guess in CLASS_TO_ID:
             # Auto-confirm: add annotation directly, no ENTER needed
-            cls_name = make_class_name(self.dart_ordinal, guess)
-            if cls_name in CLASS_TO_ID:
-                self.annotations.append((x, y, cls_name))
-                info = parse_class_name(cls_name)
-                self.last_auto_msg = f"d{self.dart_ordinal} {guess} — {info['label']}"
-                if self.dart_ordinal < 3:
-                    self.dart_ordinal += 1
-                self.click_point = None
-                self.text_input = ""
-                self.guess_segment = ""
-                return True  # auto-confirmed
+            dart_num = len(self.annotations) + 1
+            self.annotations.append((x, y, guess))
+            info = parse_class_name(guess)
+            self.last_auto_msg = f"dart {dart_num} {guess} — {info['label']}"
+            self.click_point = None
+            self.text_input = ""
+            self.guess_segment = ""
+            return True  # auto-confirmed
         # No guess or invalid — fall back to manual input
         self.click_point = (x, y)
         self.guess_segment = guess or ""
@@ -212,20 +308,18 @@ class AnnotationSession:
             msg = f"Invalid segment: '{self.text_input}'"
             self.text_input = ""
             return False, msg
-        cls_name = make_class_name(self.dart_ordinal, seg)
-        if cls_name not in CLASS_TO_ID:
-            msg = f"Unknown class: {cls_name}"
+        if seg not in CLASS_TO_ID:
+            msg = f"Unknown class: {seg}"
             self.text_input = ""
             return False, msg
         px, py = self.click_point
-        self.annotations.append((px, py, cls_name))
-        info = parse_class_name(cls_name)
-        msg = f"d{self.dart_ordinal} {seg} at ({px}, {py}) — {info['label']}"
+        dart_num = len(self.annotations) + 1
+        self.annotations.append((px, py, seg))
+        info = parse_class_name(seg)
+        msg = f"dart {dart_num} {seg} at ({px}, {py}) — {info['label']}"
         self.click_point = None
         self.text_input = ""
         self.guess_segment = ""
-        if self.dart_ordinal < 3:
-            self.dart_ordinal += 1
         return True, msg
 
     def cancel_click(self):
@@ -236,9 +330,7 @@ class AnnotationSession:
     def undo(self):
         if not self.annotations:
             return None
-        removed = self.annotations.pop()
-        self.dart_ordinal = max(1, self.dart_ordinal - 1)
-        return removed
+        return self.annotations.pop()
 
     def handle_key(self, key):
         """Handle keypress during text input. Returns True if consumed."""
@@ -464,14 +556,14 @@ def render_control_panel(
     # Show labels prominently in REVIEW
     if state == UIState.REVIEW and session:
         confs = prediction_confidences or {}
-        for ax, ay, cls_name in session.annotations:
-            info = parse_class_name(cls_name)
-            colors_d = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
-            color_d = colors_d.get(info["ordinal"], (255, 255, 255))
-            conf_str = f" ({confs[cls_name]:.0%})" if cls_name in confs else ""
+        dart_colors = [(0, 255, 0), (0, 255, 255), (0, 0, 255)]
+        for i, (ax, ay, seg_name) in enumerate(session.annotations):
+            color_d = dart_colors[i % len(dart_colors)]
+            info = parse_class_name(seg_name)
+            conf_str = f" ({confs[seg_name]:.0%})" if seg_name in confs else ""
             cv2.putText(
                 cp,
-                f"  d{info['ordinal']}: {info['label']}{conf_str}",
+                f"  dart {i + 1}: {info['label']}{conf_str}",
                 (10, cp_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -628,15 +720,14 @@ def render_annotations(display, session, box_size, prediction_confidences=None):
     if session is None:
         return
     confs = prediction_confidences or {}
-    colors = {1: (0, 255, 0), 2: (0, 255, 255), 3: (0, 0, 255)}
+    dart_colors = [(0, 255, 0), (0, 255, 255), (0, 0, 255)]
     half = box_size // 2
-    for ax, ay, cls_name in session.annotations:
-        info = parse_class_name(cls_name)
-        color = colors.get(info["ordinal"], (255, 255, 255))
+    for i, (ax, ay, seg_name) in enumerate(session.annotations):
+        color = dart_colors[i % len(dart_colors)]
         cv2.rectangle(display, (ax - half, ay - half), (ax + half, ay + half), color, 2)
         cv2.circle(display, (ax, ay), 3, color, -1)
-        conf_str = f" {confs[cls_name]:.0%}" if cls_name in confs else ""
-        label = f"d{info['ordinal']} {info['segment']}{conf_str}"
+        conf_str = f" {confs[seg_name]:.0%}" if seg_name in confs else ""
+        label = f"dart {i + 1} {seg_name}{conf_str}"
         cv2.putText(
             display,
             label,
@@ -650,13 +741,12 @@ def render_annotations(display, session, box_size, prediction_confidences=None):
         px, py = session.click_point
         cv2.circle(display, (px, py), 7, (255, 0, 255), 2)
         cv2.circle(display, (px, py), 2, (255, 0, 255), -1)
+        dart_num = len(session.annotations) + 1
         if (
             session.guess_segment
             and session.text_input == session.guess_segment.lower()
         ):
-            text = (
-                f"Dart {session.dart_ordinal} > [{session.guess_segment}]  ENTER=accept"
-            )
+            text = f"Dart {dart_num} > [{session.guess_segment}]  ENTER=accept"
             cv2.putText(
                 display,
                 text,
@@ -667,7 +757,7 @@ def render_annotations(display, session, box_size, prediction_confidences=None):
                 2,
             )
         else:
-            text = f"Dart {session.dart_ordinal} > {session.text_input}_"
+            text = f"Dart {dart_num} > {session.text_input}_"
             cv2.putText(
                 display,
                 text,
@@ -709,21 +799,20 @@ _session_ref = [None]
 _auto_confirmed = [False]  # signal that a click auto-confirmed
 
 
-def _predict_annotations(yolo_model, batch_frames, conf=0.25):
-    """Run YOLO on batch frames and build annotation lists with carry-forward.
+def _predict_annotations(yolo_model, batch_frames, homography=None, crop_offset=(0, 0), conf=0.25):
+    """Run 1-class YOLO on batch frames and build annotation lists with carry-forward.
 
-    Annotations are (x, y, class_name) tuples (same as manual).
-    Also returns a confidence dict keyed by class_name for display.
+    Detects dart positions (class 0), classifies each tip via geometry.
+    Annotations are (x, y, segment_name) tuples (same as manual).
+    Also returns a confidence dict keyed by segment_name for display.
     Returns (annotations_list_per_frame, confidence_dict) or (None, None).
     """
     if yolo_model is None or not batch_frames:
         return None, None
 
-    from classes import ID_TO_CLASS, CLASS_TO_ID, parse_class_name, make_class_name
-
     all_frame_annotations = []
     previous = []
-    confidences = {}  # cls_name -> confidence
+    confidences = {}  # seg_name -> confidence
 
     for fi, frame in enumerate(batch_frames):
         results = yolo_model.predict(frame, conf=conf, verbose=False)
@@ -734,21 +823,9 @@ def _predict_annotations(yolo_model, batch_frames, conf=0.25):
         frame_annotations = list(previous)
 
         for box in sorted(boxes, key=lambda b: float(b.conf[0]), reverse=True):
-            cls_id = int(box.cls[0])
             cls_conf = float(box.conf[0])
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-
-            raw_cls_name = ID_TO_CLASS.get(cls_id, None)
-            if raw_cls_name is None:
-                continue
-
-            # Extract segment and remap to correct ordinal for this frame
-            info = parse_class_name(raw_cls_name)
-            correct_ordinal = len(frame_annotations) + 1  # 1-based
-            correct_cls_name = make_class_name(correct_ordinal, info["segment"])
-            if correct_cls_name not in CLASS_TO_ID:
-                continue
 
             # Skip if close to existing annotation
             is_duplicate = False
@@ -759,8 +836,17 @@ def _predict_annotations(yolo_model, batch_frames, conf=0.25):
             if is_duplicate:
                 continue
 
-            frame_annotations.append((cx, cy, correct_cls_name))
-            confidences[correct_cls_name] = cls_conf
+            # Geometry classify the tip position
+            if homography is not None:
+                seg_name = geometry_classify(cx, cy, homography, crop_offset)
+            else:
+                seg_name = "MISS"  # fallback if no homography
+
+            if seg_name is None or seg_name not in CLASS_TO_ID:
+                continue
+
+            frame_annotations.append((cx, cy, seg_name))
+            confidences[seg_name] = cls_conf
             break
 
         if len(frame_annotations) <= len(previous):
@@ -787,7 +873,7 @@ def _mouse_callback(event, x, y, flags, param):
 
 
 def collect_data(
-    outdir="data/training",
+    outdir="data/training_v2",
     use_undistort=True,
     box_size=30,
     trigger_mode="audio",
@@ -834,10 +920,27 @@ def collect_data(
         print(f"Crop ROI: ({x}, {y}) {w}x{h}")
 
     homography = None
+    board_center = None  # board center in crop-pixel space for bbox expansion
     if config.BOARD_HOMOGRAPHY_PATH.exists():
         hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH))
         homography = hom_data["homography"]
         print("Board homography loaded — segment guess enabled")
+        # Compute board center in crop-pixel space (inverse homography from canonical center)
+        try:
+            H_inv = np.linalg.inv(homography)
+            cx_can, cy_can = config.CANONICAL_CENTER
+            pts = np.array([[[float(cx_can), float(cy_can)]]], dtype=np.float32)
+            transformed = cv2.perspectiveTransform(pts, H_inv)
+            bc_full_x = float(transformed[0][0][0])
+            bc_full_y = float(transformed[0][0][1])
+            # Subtract crop offset to get crop-space coordinates
+            if crop_roi is not None:
+                cx_off, cy_off, _, _ = crop_roi
+                board_center = (bc_full_x - cx_off, bc_full_y - cy_off)
+            else:
+                board_center = (bc_full_x, bc_full_y)
+        except Exception as e:
+            print(f"WARNING: Could not compute board center: {e}")
 
     audio = None
     video = None
@@ -867,7 +970,7 @@ def collect_data(
     create_window(panel_win, default_width=400, default_height=380)
     cv2.setMouseCallback(win, _mouse_callback)
 
-    print(f"\n=== YOLO Training Data Collection (189 classes) ===")
+    print(f"\n=== YOLO Training Data Collection (v2, 1-class detection) ===")
     print(f"Output: {outdir.resolve()}")
     print(f"Continuing from frame {frame_counter}")
     print(f"Batch mode: throw up to 3 darts, then annotate all")
@@ -881,7 +984,6 @@ def collect_data(
     paused_from = None  # state to resume to when unpausing
     session = None
     _session_ref[0] = None
-    dart_ordinal = 1
     previous_annotations = []
 
     # Batch: list of captured frames during a round
@@ -955,7 +1057,8 @@ def collect_data(
 
                     if n >= 3:
                         # All 3 darts captured — try model prediction first
-                        predicted, pred_confs = _predict_annotations(yolo_model, batch_frames)
+                        predicted, pred_confs = _predict_annotations(
+                            yolo_model, batch_frames, homography, crop_offset)
                         if predicted:
                             prediction_confidences = pred_confs or {}
                             # Model predicted all darts — save and go to REVIEW
@@ -965,35 +1068,35 @@ def collect_data(
                                 cv2.imwrite(str(img_dir / fname), batch_frames[fi])
                                 label_name = f"frame_{frame_counter:05d}.txt"
                                 with open(label_dir / label_name, "w") as lf:
-                                    for (ax, ay, cn) in anns:
-                                        cls_id = CLASS_TO_ID[cn]
-                                        lf.write(f"{cls_id} {ax/w_img:.6f} {ay/h_img:.6f} "
-                                                 f"{box_size/w_img:.6f} {box_size/h_img:.6f}\n")
-                                entry = {"filename": fname, "darts": [{"x": ax, "y": ay, "class": cn} for (ax, ay, cn) in anns],
+                                    for (ax, ay, seg) in anns:
+                                        bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center)
+                                        lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                                entry = {"filename": fname,
+                                         "darts": [{"tip_x": ax, "tip_y": ay, "segment": seg} for (ax, ay, seg) in anns],
                                          "n_darts": len(anns), "timestamp": time.time()}
                                 with open(annotations_path, "a") as f:
                                     f.write(json.dumps(entry) + "\n")
                                 frame_counter += 1
                                 print(f"  Auto-saved: {fname} with {len(anns)} dart(s)")
                             previous_annotations = list(predicted[-1])
-                            dart_ordinal = len(predicted[-1]) + 1
-                            session = AnnotationSession(homography=homography, previous_annotations=previous_annotations,
-                                                        start_ordinal=dart_ordinal, crop_offset=crop_offset)
+                            session = AnnotationSession(homography=homography,
+                                                        previous_annotations=previous_annotations,
+                                                        crop_offset=crop_offset)
                             _session_ref[0] = session
                             state = UIState.REVIEW
                             review_enter_time = time.monotonic()
-                            for (_, _, cn) in predicted[-1]:
-                                info = parse_class_name(cn)
-                                print(f"    d{info['ordinal']}: {info['label']}")
+                            for i, (_, _, seg) in enumerate(predicted[-1]):
+                                info = parse_class_name(seg)
+                                print(f"    dart {i+1}: {info['label']}")
                             print("  Model predicted — pull darts or X to edit")
                         else:
                             # Fall back to manual
                             state = UIState.ANNOTATING
                             batch_index = 0
-                            dart_ordinal = 1
                             previous_annotations = []
-                            session = AnnotationSession(homography=homography, previous_annotations=[],
-                                                        start_ordinal=1, crop_offset=crop_offset)
+                            session = AnnotationSession(homography=homography,
+                                                        previous_annotations=[],
+                                                        crop_offset=crop_offset)
                             _session_ref[0] = session
                             print(f"  3 darts captured — click tips to annotate")
                     else:
@@ -1020,7 +1123,8 @@ def collect_data(
 
                 elif collect_remaining <= 0:
                     # Timeout — try model prediction first
-                    predicted, pred_confs = _predict_annotations(yolo_model, batch_frames)
+                    predicted, pred_confs = _predict_annotations(
+                        yolo_model, batch_frames, homography, crop_offset)
                     if predicted:
                         prediction_confidences = pred_confs or {}
                         for fi, anns in enumerate(predicted):
@@ -1029,19 +1133,19 @@ def collect_data(
                             cv2.imwrite(str(img_dir / fname), batch_frames[fi])
                             label_name = f"frame_{frame_counter:05d}.txt"
                             with open(label_dir / label_name, "w") as lf:
-                                for (ax, ay, cn) in anns:
-                                    cls_id = CLASS_TO_ID[cn]
-                                    lf.write(f"{cls_id} {ax/w_img:.6f} {ay/h_img:.6f} "
-                                             f"{box_size/w_img:.6f} {box_size/h_img:.6f}\n")
-                            entry = {"filename": fname, "darts": [{"x": ax, "y": ay, "class": cn} for (ax, ay, cn) in anns],
+                                for (ax, ay, seg) in anns:
+                                    bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center)
+                                    lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                            entry = {"filename": fname,
+                                     "darts": [{"tip_x": ax, "tip_y": ay, "segment": seg} for (ax, ay, seg) in anns],
                                      "n_darts": len(anns), "timestamp": time.time()}
                             with open(annotations_path, "a") as f:
                                 f.write(json.dumps(entry) + "\n")
                             frame_counter += 1
                         previous_annotations = list(predicted[-1])
-                        dart_ordinal = len(predicted[-1]) + 1
-                        session = AnnotationSession(homography=homography, previous_annotations=previous_annotations,
-                                                    start_ordinal=dart_ordinal, crop_offset=crop_offset)
+                        session = AnnotationSession(homography=homography,
+                                                    previous_annotations=previous_annotations,
+                                                    crop_offset=crop_offset)
                         _session_ref[0] = session
                         state = UIState.REVIEW
                         review_enter_time = time.monotonic()
@@ -1049,10 +1153,10 @@ def collect_data(
                     else:
                         state = UIState.ANNOTATING
                         batch_index = 0
-                        dart_ordinal = 1
                         previous_annotations = []
-                        session = AnnotationSession(homography=homography, previous_annotations=[],
-                                                    start_ordinal=1, crop_offset=crop_offset)
+                        session = AnnotationSession(homography=homography,
+                                                    previous_annotations=[],
+                                                    crop_offset=crop_offset)
                         _session_ref[0] = session
                         print(f"  Timeout — {len(batch_frames)} frame(s), click tips to annotate")
 
@@ -1089,6 +1193,7 @@ def collect_data(
                 display = frame.copy()
 
             n_ann = len(session.annotations) if session else 0
+            dart_ordinal = session.dart_ordinal if session else 1
             render_camera_hud(
                 display,
                 state,
@@ -1146,10 +1251,9 @@ def collect_data(
                 if n >= 3:
                     state = UIState.ANNOTATING
                     batch_index = 0
-                    dart_ordinal = 1
                     previous_annotations = []
                     session = AnnotationSession(
-                        homography=homography, start_ordinal=1, crop_offset=crop_offset
+                        homography=homography, previous_annotations=[], crop_offset=crop_offset
                     )
                     _session_ref[0] = session
                     print(f"  3 frames captured — annotate frame 1")
@@ -1157,7 +1261,6 @@ def collect_data(
                     state = UIState.COLLECTING
 
             elif key == ord("r") and state != UIState.ANNOTATING:
-                dart_ordinal = 1
                 previous_annotations = []
                 batch_frames = []
                 batch_index = 0
@@ -1174,10 +1277,9 @@ def collect_data(
                 # Skip waiting, go annotate now
                 state = UIState.ANNOTATING
                 batch_index = 0
-                dart_ordinal = 1
                 previous_annotations = []
                 session = AnnotationSession(
-                    homography=homography, start_ordinal=1, crop_offset=crop_offset
+                    homography=homography, previous_annotations=[], crop_offset=crop_offset
                 )
                 _session_ref[0] = session
                 print(f"  Skipped — annotate {len(batch_frames)} frame(s)")
@@ -1222,17 +1324,14 @@ def collect_data(
                     cv2.imwrite(str(img_dir / fname), batch_frames[batch_index])
                     label_name = f"frame_{frame_counter:05d}.txt"
                     with open(label_dir / label_name, "w") as lf:
-                        for ax, ay, cls_name in session.annotations:
-                            cls_id = CLASS_TO_ID[cls_name]
-                            lf.write(
-                                f"{cls_id} {ax / w_img:.6f} {ay / h_img:.6f} "
-                                f"{box_size / w_img:.6f} {box_size / h_img:.6f}\n"
-                            )
+                        for ax, ay, seg in session.annotations:
+                            bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center)
+                            lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                     entry = {
                         "filename": fname,
                         "darts": [
-                            {"x": ax, "y": ay, "class": cn}
-                            for (ax, ay, cn) in session.annotations
+                            {"tip_x": ax, "tip_y": ay, "segment": seg}
+                            for (ax, ay, seg) in session.annotations
                         ],
                         "n_darts": len(session.annotations),
                         "timestamp": time.time(),
@@ -1244,7 +1343,7 @@ def collect_data(
 
                     # Carry forward and advance
                     previous_annotations = list(session.annotations)
-                    dart_ordinal = session.dart_ordinal
+                    next_dart_num = len(previous_annotations) + 1
                     batch_index += 1
 
                     if batch_index < len(batch_frames):
@@ -1252,12 +1351,11 @@ def collect_data(
                         session = AnnotationSession(
                             homography=homography,
                             previous_annotations=previous_annotations,
-                            start_ordinal=dart_ordinal,
                             crop_offset=crop_offset,
                         )
                         _session_ref[0] = session
                         print(
-                            f"  → Frame {batch_index + 1}/{len(batch_frames)} — click dart {dart_ordinal} tip"
+                            f"  → Frame {batch_index + 1}/{len(batch_frames)} — click dart {next_dart_num} tip"
                         )
                     else:
                         # All frames done — go to REVIEW
@@ -1283,7 +1381,6 @@ def collect_data(
                             if removed:
                                 print(f"  Undo: {removed[2]}")
                         elif key == ord("r"):
-                            dart_ordinal = 1
                             previous_annotations = []
                             batch_frames = []
                             batch_index = 0
@@ -1313,17 +1410,14 @@ def collect_data(
                     print("  Edit: press 1, 2, or 3 to re-label that dart")
 
                 elif edit_dart == 0:
-                    # Waiting for dart number
+                    # Waiting for dart number (1-based index into annotations list)
                     if key in (ord("1"), ord("2"), ord("3")):
                         dart_num = key - ord("0")
-                        found = any(parse_class_name(cn)["ordinal"] == dart_num
-                                    for (_, _, cn) in session.annotations)
-                        if found:
+                        dart_idx = dart_num - 1  # 0-based index
+                        if dart_idx < len(session.annotations):
                             edit_dart = dart_num
                             edit_text = ""
-                            cur = next(parse_class_name(cn)["segment"]
-                                       for (_, _, cn) in session.annotations
-                                       if parse_class_name(cn)["ordinal"] == dart_num)
+                            cur = session.annotations[dart_idx][2]  # segment name
                             print(f"  Editing dart {dart_num} ({cur}) — type new label + ENTER")
                         else:
                             print(f"  No dart {dart_num} in this round")
@@ -1333,44 +1427,39 @@ def collect_data(
                         print("  Edit cancelled")
 
                 elif edit_dart is not None and edit_dart >= 1:
-                    # Typing new label for a specific dart
+                    # Typing new label for a specific dart (edit_dart is 1-based)
                     if key == 13:  # ENTER — confirm
                         seg = segment_shorthand(edit_text)
                         if seg is None:
                             print(f"  Invalid: '{edit_text}' — try again")
                             edit_text = ""
+                        elif seg not in CLASS_TO_ID:
+                            print(f"  Unknown class: {seg}")
+                            edit_text = ""
                         else:
-                            cls_name = make_class_name(edit_dart, seg)
-                            if cls_name not in CLASS_TO_ID:
-                                print(f"  Unknown class: {cls_name}")
-                                edit_text = ""
-                            else:
-                                # Replace annotation for this ordinal
-                                for i, (ax, ay, cn) in enumerate(session.annotations):
-                                    if parse_class_name(cn)["ordinal"] == edit_dart:
-                                        session.annotations[i] = (ax, ay, cls_name)
-                                        info = parse_class_name(cls_name)
-                                        print(f"  d{edit_dart} → {info['label']}")
-                                        break
-                                # Re-save affected label files
-                                # Each frame N has annotations [d1..dN]
-                                for fi in range(len(batch_frames)):
-                                    frame_anns = session.annotations[:fi + 1]
-                                    h_img, w_img = batch_frames[fi].shape[:2]
-                                    saved_idx = frame_counter - len(batch_frames) + fi
-                                    label_name = f"frame_{saved_idx:05d}.txt"
-                                    # Only rewrite if this frame includes the edited dart
-                                    if fi + 1 >= edit_dart:
-                                        with open(label_dir / label_name, "w") as lf:
-                                            for (aax, aay, ccn) in frame_anns:
-                                                cls_id = CLASS_TO_ID[ccn]
-                                                lf.write(f"{cls_id} {aax/w_img:.6f} {aay/h_img:.6f} "
-                                                         f"{box_size/w_img:.6f} {box_size/h_img:.6f}\n")
-                                        print(f"  Updated: {label_name}")
-                                # Update carry-forward
-                                previous_annotations = list(session.annotations)
-                                edit_dart = None
-                                edit_text = ""
+                            dart_idx = edit_dart - 1  # 0-based
+                            ax, ay, _ = session.annotations[dart_idx]
+                            session.annotations[dart_idx] = (ax, ay, seg)
+                            info = parse_class_name(seg)
+                            print(f"  dart {edit_dart} → {info['label']}")
+                            # Re-save affected label files
+                            # Each frame N has annotations [d0..dN-1]
+                            for fi in range(len(batch_frames)):
+                                frame_anns = session.annotations[:fi + 1]
+                                h_img, w_img = batch_frames[fi].shape[:2]
+                                saved_idx = frame_counter - len(batch_frames) + fi
+                                label_name = f"frame_{saved_idx:05d}.txt"
+                                # Only rewrite if this frame includes the edited dart
+                                if fi + 1 >= edit_dart:
+                                    with open(label_dir / label_name, "w") as lf:
+                                        for (aax, aay, sseg) in frame_anns:
+                                            bcx, bcy, bw, bh = auto_expand_bbox(aax, aay, w_img, h_img, board_center)
+                                            lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                                    print(f"  Updated: {label_name}")
+                            # Update carry-forward
+                            previous_annotations = list(session.annotations)
+                            edit_dart = None
+                            edit_text = ""
                     elif key == 27:
                         edit_dart = None
                         edit_text = ""
@@ -1387,7 +1476,6 @@ def collect_data(
                     edit_dart = None
                     edit_text = ""
                     prediction_confidences = {}
-                    dart_ordinal = 1
                     previous_annotations = []
                     batch_frames = []
                     batch_index = 0
@@ -1746,12 +1834,11 @@ def label_offline(outdir="data/training", box_size=30):
     cv2.setMouseCallback(win, _mouse_callback)
 
     img_index = 0
-    dart_ordinal = 1
     previous_annotations = []
     labeled_count = 0
 
     # Group images into rounds by looking at unlabeled.jsonl dart_in_round
-    # or just let the user manage ordinals with R
+    # or just let the user manage annotations with R
     round_frame = 0  # which frame in the current round (0, 1, 2)
 
     while img_index < len(unlabeled):
@@ -1765,10 +1852,11 @@ def label_offline(outdir="data/training", box_size=30):
             session = AnnotationSession(
                 homography=homography,
                 previous_annotations=previous_annotations,
-                start_ordinal=dart_ordinal,
                 crop_offset=crop_offset,
             )
             _session_ref[0] = session
+
+        dart_ordinal = session.dart_ordinal
 
         # Render
         display = frame.copy()
@@ -1924,18 +2012,15 @@ def label_offline(outdir="data/training", box_size=30):
 
                 label_name = img_path.stem + ".txt"
                 with open(label_dir / label_name, "w") as lf:
-                    for ax, ay, cls_name in session.annotations:
-                        cls_id = CLASS_TO_ID[cls_name]
-                        lf.write(
-                            f"{cls_id} {ax / w:.6f} {ay / h:.6f} "
-                            f"{box_size / w:.6f} {box_size / h:.6f}\n"
-                        )
+                    for ax, ay, seg in session.annotations:
+                        bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w, h, board_center=None)
+                        lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
 
                 entry = {
                     "filename": img_path.name,
                     "darts": [
-                        {"x": ax, "y": ay, "class": cn}
-                        for (ax, ay, cn) in session.annotations
+                        {"tip_x": ax, "tip_y": ay, "segment": seg}
+                        for (ax, ay, seg) in session.annotations
                     ],
                     "n_darts": len(session.annotations),
                     "timestamp": time.time(),
@@ -1947,7 +2032,6 @@ def label_offline(outdir="data/training", box_size=30):
                 print(f"  Saved: {label_name} with {len(session.annotations)} dart(s)")
 
                 previous_annotations = list(session.annotations)
-                dart_ordinal = session.dart_ordinal
                 session = None
                 _session_ref[0] = None
                 img_index += 1
@@ -1965,7 +2049,6 @@ def label_offline(outdir="data/training", box_size=30):
                     print(f"  Undo: {removed[2]}")
 
             elif key == ord("r"):
-                dart_ordinal = 1
                 previous_annotations = []
                 round_frame = 0
                 session = None
@@ -1987,7 +2070,7 @@ if __name__ == "__main__":
 
     # Default: full batch collection (capture + annotate)
     p_collect = sub.add_parser("collect", help="Batch capture + annotate (default)")
-    p_collect.add_argument("--outdir", default="data/training")
+    p_collect.add_argument("--outdir", default="data/training_v2")
     p_collect.add_argument("--no-undistort", action="store_true")
     p_collect.add_argument("--box-size", type=int, default=30)
     p_collect.add_argument(
