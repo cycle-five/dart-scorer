@@ -48,6 +48,71 @@ from window_manager import create_window, save_window_sizes
 
 
 # ---------------------------------------------------------------------------
+# Frame naming
+# ---------------------------------------------------------------------------
+
+# Track whether lens undistortion is active (set during collection setup)
+_undistort_active = False
+_frame_resolution = (0, 0)  # (w, h) set after first frame
+
+
+def make_frame_stem(frame=None):
+    """Generate a unique frame filename stem using timestamp + metadata.
+
+    Format: YYYYMMDD_HHMMSS_fff_{undistort|raw}_{W}x{H}
+    Timestamps are unique per millisecond — no frame counter needed.
+    """
+    w, h = _frame_resolution
+    if frame is not None:
+        h, w = frame.shape[:2]
+    return config.training_frame_stem(
+        time.time() * 1000,
+        undistorted=_undistort_active,
+        width=w,
+        height=h,
+    )
+
+
+def save_training_frame(img_dir, label_dir, frame, label_lines,
+                        annotations_path=None, annotation_extra=None):
+    """Save a training frame with its label using timestamp naming.
+
+    Args:
+        img_dir: Path to images directory.
+        label_dir: Path to labels directory.
+        frame: BGR image (numpy array).
+        label_lines: List of YOLO label strings ("cls cx cy w h").
+        annotations_path: Optional path to annotations.jsonl to append to.
+        annotation_extra: Optional dict of extra fields for the annotation record.
+
+    Returns:
+        stem: The filename stem used, or None on failure.
+    """
+    stem = make_frame_stem(frame)
+    fname = f"{stem}.png"
+    label_name = f"{stem}.txt"
+
+    cv2.imwrite(str(img_dir / fname), frame)
+
+    with open(label_dir / label_name, "w") as f:
+        f.write("\n".join(label_lines) + "\n")
+
+    if annotations_path is not None:
+        import json as _json
+        entry = {
+            "filename": fname,
+            "n_darts": len(label_lines),
+            "timestamp": time.time(),
+        }
+        if annotation_extra:
+            entry.update(annotation_extra)
+        with open(annotations_path, "a") as f:
+            f.write(_json.dumps(entry) + "\n")
+
+    return stem
+
+
+# ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
 
@@ -1005,7 +1070,7 @@ def _mouse_callback(event, x, y, flags, param):
 
 
 def collect_data(
-    outdir="data/training_v2",
+    outdir=None,
     use_undistort=True,
     box_size=30,
     trigger_mode="audio",
@@ -1015,18 +1080,15 @@ def collect_data(
     settle_delay=0.7,
     collect_timeout=10.0,
 ):
-    outdir = Path(outdir)
+    outdir = Path(outdir) if outdir else config.DATASET_DIR
     img_dir = outdir / "images"
     label_dir = outdir / "labels"
     img_dir.mkdir(parents=True, exist_ok=True)
     label_dir.mkdir(parents=True, exist_ok=True)
     annotations_path = outdir / "annotations.jsonl"
 
-    existing = 0
-    if annotations_path.exists():
-        with open(annotations_path) as f:
-            existing = sum(1 for _ in f)
-    frame_counter = existing
+    global _undistort_active, _frame_resolution
+    frame_counter = 0  # kept for HUD display only
 
     from calibrate import (
         open_camera,
@@ -1041,6 +1103,7 @@ def collect_data(
     lens_params = None
     if use_undistort and config.LENS_PARAMS_PATH.exists():
         lens_params = load_lens_params()
+        _undistort_active = True
         print("Lens undistortion enabled")
     elif use_undistort:
         print("WARNING: No lens params found, running without undistortion")
@@ -1054,7 +1117,7 @@ def collect_data(
     homography = None
     board_center = None  # board center in crop-pixel space for bbox expansion
     if config.BOARD_HOMOGRAPHY_PATH.exists():
-        hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH))
+        hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH), allow_pickle=False)
         homography = hom_data["homography"]
         print("Board homography loaded — segment guess enabled")
         # Compute board center in crop-pixel space (inverse homography from canonical center)
@@ -1196,9 +1259,10 @@ def collect_data(
                             # Model predicted all darts — save and go to REVIEW
                             for fi, anns in enumerate(predicted):
                                 h_img, w_img = batch_frames[fi].shape[:2]
-                                fname = f"frame_{frame_counter:05d}.png"
+                                stem = make_frame_stem(batch_frames[fi])
+                                fname = f"{stem}.png"
                                 cv2.imwrite(str(img_dir / fname), batch_frames[fi])
-                                label_name = f"frame_{frame_counter:05d}.txt"
+                                label_name = f"{stem}.txt"
                                 with open(label_dir / label_name, "w") as lf:
                                     for (ax, ay, seg) in anns:
                                         bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[fi])
@@ -1261,9 +1325,10 @@ def collect_data(
                         prediction_confidences = pred_confs or {}
                         for fi, anns in enumerate(predicted):
                             h_img, w_img = batch_frames[fi].shape[:2]
-                            fname = f"frame_{frame_counter:05d}.png"
+                            stem = make_frame_stem(batch_frames[fi])
+                            fname = f"{stem}.png"
                             cv2.imwrite(str(img_dir / fname), batch_frames[fi])
-                            label_name = f"frame_{frame_counter:05d}.txt"
+                            label_name = f"{stem}.txt"
                             with open(label_dir / label_name, "w") as lf:
                                 for (ax, ay, seg) in anns:
                                     bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[fi])
@@ -1304,9 +1369,10 @@ def collect_data(
                         # Phase 2: wait for board to stabilize after pull
                         if video.is_calm():
                             # Save background frame (empty board)
-                            bg_fname = f"frame_{frame_counter:05d}.png"
+                            bg_stem = make_frame_stem(frame)
+                            bg_fname = f"{bg_stem}.png"
                             cv2.imwrite(str(img_dir / bg_fname), frame)
-                            with open(label_dir / f"frame_{frame_counter:05d}.txt", "w") as lf:
+                            with open(label_dir / f"{bg_stem}.txt", "w") as lf:
                                 pass  # empty label = background
                             frame_counter += 1
                             print(f"  Background saved: {bg_fname}")
@@ -1452,9 +1518,10 @@ def collect_data(
 
                     # Save current frame immediately
                     h_img, w_img = batch_frames[batch_index].shape[:2]
-                    fname = f"frame_{frame_counter:05d}.png"
+                    stem = make_frame_stem(batch_frames[batch_index])
+                    fname = f"{stem}.png"
                     cv2.imwrite(str(img_dir / fname), batch_frames[batch_index])
-                    label_name = f"frame_{frame_counter:05d}.txt"
+                    label_name = f"{stem}.txt"
                     with open(label_dir / label_name, "w") as lf:
                         for ax, ay, seg in session.annotations:
                             bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[batch_index])
@@ -1637,7 +1704,7 @@ def collect_data(
 
 
 def capture_only(
-    outdir="data/training",
+    outdir=None,
     use_undistort=True,
     trigger_mode="video",
     audio_device=None,
@@ -1650,14 +1717,13 @@ def capture_only(
     Just throw darts. Each impact auto-captures a settled frame.
     Press R between rounds. Images saved without labels for later annotation.
     """
-    outdir = Path(outdir)
+    global _undistort_active, _frame_resolution
+    outdir = Path(outdir) if outdir else config.DATASET_DIR
     img_dir = outdir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
     unlabeled_log = outdir / "unlabeled.jsonl"
 
-    # Count existing images to continue numbering
-    existing = len(list(img_dir.glob("*.png")))
-    frame_counter = existing
+    frame_counter = 0  # display counter only
 
     from calibrate import (
         open_camera,
@@ -1672,6 +1738,7 @@ def capture_only(
     lens_params = None
     if use_undistort and config.LENS_PARAMS_PATH.exists():
         lens_params = load_lens_params()
+        _undistort_active = True
 
     crop_roi = load_crop_roi()
     crop_offset = (0, 0)  # homography calibrated in cropped space
@@ -1739,7 +1806,8 @@ def capture_only(
                 settle_remaining = max(0, settle_delay - elapsed)
                 if elapsed >= settle_delay:
                     # Save frame
-                    fname = f"frame_{frame_counter:05d}.png"
+                    stem = make_frame_stem(frame)
+                    fname = f"{stem}.png"
                     cv2.imwrite(str(img_dir / fname), frame)
                     entry = {
                         "filename": fname,
@@ -1871,7 +1939,8 @@ def capture_only(
                 else:
                     print("Round reset")
             elif key == ord(" ") and state in (UIState.LISTENING, UIState.PAUSED):
-                fname = f"frame_{frame_counter:05d}.png"
+                stem = make_frame_stem(frame)
+                fname = f"{stem}.png"
                 cv2.imwrite(str(img_dir / fname), frame)
                 darts_this_round += 1
                 entry = {
@@ -1921,13 +1990,13 @@ def capture_only(
 # ---------------------------------------------------------------------------
 
 
-def label_offline(outdir="data/training", box_size=30):
+def label_offline(outdir=None, box_size=30):
     """Browse and label previously captured frames.
 
     Shows each unlabeled image, lets you click dart tips and type labels.
     Skips frames that already have label files.
     """
-    outdir = Path(outdir)
+    outdir = Path(outdir) if outdir else config.DATASET_DIR
     img_dir = outdir / "images"
     label_dir = outdir / "labels"
     label_dir.mkdir(parents=True, exist_ok=True)
@@ -1950,7 +2019,7 @@ def label_offline(outdir="data/training", box_size=30):
     # Load homography for guessing
     homography = None
     if config.BOARD_HOMOGRAPHY_PATH.exists():
-        hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH))
+        hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH), allow_pickle=False)
         homography = hom_data["homography"]
         print("Board homography loaded — segment guess enabled")
 
@@ -2202,7 +2271,8 @@ if __name__ == "__main__":
 
     # Default: full batch collection (capture + annotate)
     p_collect = sub.add_parser("collect", help="Batch capture + annotate (default)")
-    p_collect.add_argument("--outdir", default="data/training_v2")
+    p_collect.add_argument("--outdir", default=None,
+                           help=f"Output directory (default: {config.DATASET_DIR})")
     p_collect.add_argument("--no-undistort", action="store_true")
     p_collect.add_argument("--box-size", type=int, default=30)
     p_collect.add_argument(
@@ -2216,7 +2286,7 @@ if __name__ == "__main__":
 
     # Capture-only: just record frames
     p_capture = sub.add_parser("capture", help="Capture frames only, no labeling")
-    p_capture.add_argument("--outdir", default="data/training")
+    p_capture.add_argument("--outdir", default=None)
     p_capture.add_argument("--no-undistort", action="store_true")
     p_capture.add_argument(
         "--trigger", choices=["audio", "video", "manual"], default="video"
@@ -2228,7 +2298,7 @@ if __name__ == "__main__":
 
     # Label: annotate unlabeled frames offline
     p_label = sub.add_parser("label", help="Label previously captured frames")
-    p_label.add_argument("--outdir", default="data/training")
+    p_label.add_argument("--outdir", default=None)
     p_label.add_argument("--box-size", type=int, default=30)
 
     args = parser.parse_args()

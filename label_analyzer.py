@@ -24,9 +24,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from classes import ID_TO_CLASS, CLASS_TO_ID, SEGMENTS, ORDINALS
 
 PORT = 8765
-DATA_DIR = Path(__file__).parent / "data" / "training"
-IMAGES_DIR = DATA_DIR / "images"
-LABELS_DIR = DATA_DIR / "labels"
+import config as _config
+DATA_DIR = _config.DATASET_DIR
+IMAGES_DIR = _config.DATASET_IMAGES_DIR
+LABELS_DIR = _config.DATASET_LABELS_DIR
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -334,6 +335,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, "Bad class id")
                 return
             stem = urllib.parse.unquote(rest[slash + 1:])
+            # Sanitize: reject path traversal attempts
+            if ".." in stem or "/" in stem or "\\" in stem or "\x00" in stem:
+                self.send_error(400, "Invalid filename")
+                return
             jpeg = render_annotated_thumbnail(stem, cid)
             if jpeg is None:
                 self.send_error(404, "Image not found or could not render")
@@ -344,6 +349,10 @@ class Handler(BaseHTTPRequestHandler):
         # ----- Raw source image: /image/<stem> -----
         if path.startswith("/image/"):
             stem = urllib.parse.unquote(path[len("/image/"):])
+            # Sanitize: reject path traversal attempts
+            if ".." in stem or "/" in stem or "\\" in stem or "\x00" in stem:
+                self.send_error(400, "Invalid filename")
+                return
             img_path = IMAGES_DIR / f"{stem}.png"
             if not img_path.exists():
                 img_path = IMAGES_DIR / f"{stem}.jpg"

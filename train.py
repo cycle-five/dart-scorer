@@ -28,10 +28,7 @@ import config
 from classes_v2 import NUM_CLASSES, ID_TO_CLASS, CLASS_TO_ID, CLASS_NAMES, parse_class_name
 
 
-# V3 dataset (63 classes, no ordinals) is preferred; fall back to v1
-DATASET_YAML_V3 = config.PROJECT_ROOT / "data" / "training_v3" / "dataset.yaml"
-DATASET_YAML_V1 = config.PROJECT_ROOT / "data" / "training" / "dataset.yaml"
-DATASET_YAML = DATASET_YAML_V3 if DATASET_YAML_V3.exists() else DATASET_YAML_V1
+DATASET_YAML = config.DATASET_YAML_PATH
 RUNS_DIR = config.PROJECT_ROOT / "runs"
 SNAPSHOTS_DIR = config.PROJECT_ROOT / "runs" / "snapshots"
 

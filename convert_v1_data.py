@@ -60,7 +60,7 @@ def load_homography():
     path = config.BOARD_HOMOGRAPHY_PATH
     if not path.exists():
         return None
-    data = np.load(str(path))
+    data = np.load(str(path), allow_pickle=False)
     return data["homography"]
 
 
@@ -223,7 +223,7 @@ def geometry_check():
     # Load crop ROI to offset coordinates
     crop_offset = (0, 0)
     if config.CROP_ROI_PATH.exists():
-        roi = np.load(str(config.CROP_ROI_PATH))
+        roi = np.load(str(config.CROP_ROI_PATH), allow_pickle=False)
         crop_data = roi["crop_roi"]
         crop_offset = (int(crop_data[0]), int(crop_data[1]))
 
@@ -399,7 +399,7 @@ def convert_dataset():
     # Load crop offset
     crop_offset = (0, 0)
     if config.CROP_ROI_PATH.exists():
-        roi = np.load(str(config.CROP_ROI_PATH))
+        roi = np.load(str(config.CROP_ROI_PATH), allow_pickle=False)
         crop_data = roi["crop_roi"]
         crop_offset = (int(crop_data[0]), int(crop_data[1]))
 

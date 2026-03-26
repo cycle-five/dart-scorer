@@ -9,12 +9,12 @@ Usage:
 """
 
 from pathlib import Path
-from classes import CLASS_NAMES, NUM_CLASSES
+from classes_v2 import CLASS_NAMES, NUM_CLASSES
 import config
 
 
-def generate(outdir="data/training"):
-    outdir = Path(outdir)
+def generate(outdir=None):
+    outdir = Path(outdir) if outdir else config.DATASET_DIR
     outdir.mkdir(parents=True, exist_ok=True)
     yaml_path = outdir / "dataset.yaml"
 

@@ -439,7 +439,7 @@ def main():
         print("Run 'python calibrate.py --board' first.")
         sys.exit(1)
 
-    hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH))
+    hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH), allow_pickle=False)
     homography = hom_data['homography']
 
     # Crop offset: only needed if homography was calibrated on uncropped frames.

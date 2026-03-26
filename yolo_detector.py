@@ -1,8 +1,9 @@
 """
-yolo_detector.py — V2 YOLO dart detection + geometry classification.
+yolo_detector.py — YOLO dart detection + scoring.
 
-Uses a 1-class YOLO model to detect darts, then classifies each dart
-using board geometry (homography → polar → sector/ring).
+Uses a 63-class YOLO model that directly classifies each dart into its
+board segment (S1-S20, D1-D20, T1-T20, S_BULL, D_BULL, MISS).
+Geometry (homography) is used as a confidence check, not primary classification.
 """
 
 import math
@@ -13,17 +14,16 @@ import numpy as np
 
 import config
 from board import classify_dart, apply_homography
+from classes_v2 import ID_TO_CLASS, parse_class_name, NUM_CLASSES
 
 
 RUNS_DIR = config.PROJECT_ROOT / "runs"
 
-# Resolution-tagged model directories: dartscorer_v2_{W}x{H}
-# Falls back to any dartscorer_v2* model if no exact match
 def find_best_weights(frame_width=None, frame_height=None):
-    """Find the best YOLO weights for a given resolution.
+    """Find the best YOLO weights.
 
-    Looks for runs/detect/dartscorer_v2_{W}x{H}/weights/best.pt first,
-    then falls back to any dartscorer_v2*/weights/best.pt.
+    Searches runs/detect/dartscorer*/weights/best.pt, preferring the
+    most recently modified model.
 
     Returns:
         Path to best.pt, or None if no model found.
@@ -32,28 +32,20 @@ def find_best_weights(frame_width=None, frame_height=None):
     if not detect_dir.exists():
         return None
 
-    # Try exact resolution match first
-    if frame_width and frame_height:
-        exact = detect_dir / f"dartscorer_v2_{frame_width}x{frame_height}" / "weights" / "best.pt"
-        if exact.exists():
-            return exact
-
-    # Fall back to any v2 model (prefer resolution-tagged, then generic)
     candidates = []
     for d in sorted(detect_dir.iterdir()):
-        if d.is_dir() and d.name.startswith("dartscorer_v2"):
+        if d.is_dir() and d.name.startswith("dartscorer"):
             best = d / "weights" / "best.pt"
             if best.exists():
                 candidates.append(best)
 
-    # Prefer the most recently modified
     if candidates:
         return max(candidates, key=lambda p: p.stat().st_mtime)
 
     return None
 
 
-DEFAULT_WEIGHTS = find_best_weights() or (RUNS_DIR / "detect" / "dartscorer_v2" / "weights" / "best.pt")
+DEFAULT_WEIGHTS = find_best_weights() or (RUNS_DIR / "detect" / "dartscorer" / "weights" / "best.pt")
 
 
 def _estimate_tip(bbox, board_center):
@@ -208,6 +200,7 @@ class YOLODartDetector:
 
         for box in result.boxes:
             yolo_conf = float(box.conf[0])
+            cls_id = int(box.cls[0])
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             bbox = (int(x1), int(y1), int(x2), int(y2))
 
@@ -217,23 +210,26 @@ class YOLODartDetector:
             else:
                 tip = (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-            # Geometry classification
-            classification = None
-            segment = "unknown"
-            score = 0
-            label = "Unknown"
-            geo_confidence = 0.0
+            # Primary classification from YOLO (63-class model)
+            cls_name = ID_TO_CLASS.get(cls_id, "unknown")
+            info = parse_class_name(cls_name) if cls_name != "unknown" else None
+            segment = info["segment"] if info else "unknown"
+            score = info["score"] if info else 0
+            label = info["label"] if info else "Unknown"
+
+            # Geometry as confidence check (not primary classification)
+            geo_classification = None
+            geo_confidence = 1.0  # default: trust YOLO
+            geo_agrees = True
 
             if self.homography is not None:
                 tip_full = (tip[0] + self.crop_offset[0],
                             tip[1] + self.crop_offset[1])
                 try:
                     can = apply_homography(tip_full, self.homography)
-                    classification = classify_dart(can[0], can[1])
-                    segment = classification["segment"]
-                    score = classification["score"]
-                    label = classification["label"]
-                    geo_confidence = classification["confidence"]
+                    geo_classification = classify_dart(can[0], can[1])
+                    geo_confidence = geo_classification["confidence"]
+                    geo_agrees = geo_classification["segment"] == segment
                 except Exception:
                     pass
 
@@ -241,11 +237,13 @@ class YOLODartDetector:
                 "tip": tip,
                 "bbox": bbox,
                 "yolo_confidence": yolo_conf,
-                "classification": classification,
+                "yolo_class": cls_name,
+                "classification": geo_classification,
                 "segment": segment,
                 "score": score,
                 "label": label,
                 "confidence": geo_confidence,
+                "geo_agrees": geo_agrees,
             })
 
         return detections
@@ -325,17 +323,19 @@ class YOLODartDetector:
             conf = det["yolo_confidence"]
             geo_conf = det["confidence"]
             segment = det["segment"]
+            geo_agrees = det.get("geo_agrees", True)
             label_text = f"{segment} ({conf:.0%})"
-            if geo_conf < config.GEO_CONF_MODERATE + 0.1:
-                label_text += " ?"
+            if not geo_agrees:
+                geo_seg = det["classification"]["segment"] if det.get("classification") else "?"
+                label_text += f" [geo:{geo_seg}]"
 
-            # Color by geometry confidence
-            if geo_conf > config.GEO_CONF_HIGH:
-                color = (0, 255, 0)    # green — confident
-            elif geo_conf > config.GEO_CONF_MODERATE:
-                color = (0, 255, 255)  # yellow — moderate
+            # Color: green if YOLO+geo agree, yellow if geo unsure, red if disagree
+            if geo_agrees and geo_conf > config.GEO_CONF_MODERATE:
+                color = (0, 255, 0)    # green — YOLO + geo agree
+            elif not geo_agrees:
+                color = (0, 0, 255)    # red — YOLO and geo disagree
             else:
-                color = (0, 0, 255)    # red — ambiguous
+                color = (0, 255, 255)  # yellow — geo unsure
 
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
             cv2.putText(out, label_text, (x1, y1 - 8),

@@ -23,9 +23,10 @@ from classes import ID_TO_CLASS, SEGMENTS, ORDINALS, parse_class_name, NUM_CLASS
 import config
 
 
-def load_class_counts(outdir="data/training"):
+def load_class_counts(outdir=None):
     """Count instances of each class across all label files."""
-    label_dir = Path(outdir) / "labels"
+    outdir = Path(outdir) if outdir else config.DATASET_DIR
+    label_dir = outdir / "labels"
     counts = Counter()
 
     for label_path in label_dir.glob("*.txt"):
@@ -156,7 +157,7 @@ def render_heatmap(counts, save_path=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze training data distribution")
-    parser.add_argument("--outdir", default="data/training")
+    parser.add_argument("--outdir", default=None)
     parser.add_argument("--save", action="store_true", help="Save heatmap image")
     args = parser.parse_args()
 

@@ -68,7 +68,7 @@ def load_lens_params():
             f"Lens parameters not found at {path}.\n"
             "Run 'python calibrate.py --lens' to generate them."
         )
-    data = np.load(str(path))
+    data = np.load(str(path), allow_pickle=False)
     return (
         data["camera_matrix"],
         data["dist_coeffs"],
@@ -592,7 +592,7 @@ def load_crop_roi():
     path = config.CROP_ROI_PATH
     if not path.exists():
         return None
-    data = np.load(str(path))
+    data = np.load(str(path), allow_pickle=False)
     roi = data["crop_roi"]
     return tuple(int(v) for v in roi)
 

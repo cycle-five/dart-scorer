@@ -15,7 +15,6 @@ Usage:
 import argparse
 import json
 import os
-import pickle
 import time
 from pathlib import Path
 
@@ -191,7 +190,7 @@ def _retrain_online(info_path, clf_holder):
         path = SAMPLES_DIR / entry["filename"]
         if not path.exists():
             continue
-        clip = np.load(str(path))
+        clip = np.load(str(path), allow_pickle=False)
         X.append(compute_features(clip))
         y.append(1 if entry["label"] == "dart" else 0)
 
@@ -209,8 +208,8 @@ def _retrain_online(info_path, clf_holder):
 
     # Also save to disk
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(clf, f)
+    import joblib
+    joblib.dump(clf, MODEL_PATH)
 
     return dart_count, noise_count
 
@@ -326,7 +325,9 @@ def record_samples(device=None, rms_threshold=0.01):
                 normalized = clip
             int16_data = (normalized * 32767).astype(np.int16)
 
-            wav_path = os.path.join(tempfile.gettempdir(), "dart_preview.wav")
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            wav_path = tmp.name
+            tmp.close()
             with wave.open(wav_path, 'w') as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
@@ -611,7 +612,7 @@ def train_classifier():
         path = SAMPLES_DIR / entry["filename"]
         if not path.exists():
             continue
-        clip = np.load(str(path))
+        clip = np.load(str(path), allow_pickle=False)
         features = compute_features(clip)
         X.append(features)
         y.append(1 if entry["label"] == "dart" else 0)
@@ -638,8 +639,8 @@ def train_classifier():
 
     # Save
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(clf, f)
+    import joblib
+    joblib.dump(clf, MODEL_PATH)
     print(f"Model saved to {MODEL_PATH}")
 
     # Feature importance
@@ -667,8 +668,8 @@ def test_live(device=None):
         print(f"No model found at {MODEL_PATH}. Run --train first.")
         return
 
-    with open(MODEL_PATH, "rb") as f:
-        clf = pickle.load(f)
+    import joblib
+    clf = joblib.load(MODEL_PATH)
 
     if device is None:
         device = find_emeet_device()
@@ -779,8 +780,8 @@ class DartAudioTrigger:
             print(f"  Run 'python audio_trigger.py --record' then '--train' to create one")
             return False
 
-        with open(MODEL_PATH, "rb") as f:
-            self._clf = pickle.load(f)
+        import joblib
+        self._clf = joblib.load(MODEL_PATH)
 
         device = self._device
         if device is None:

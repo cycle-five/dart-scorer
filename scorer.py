@@ -116,7 +116,7 @@ def main():
     # --- Load homography ---
     homography = None
     if config.BOARD_HOMOGRAPHY_PATH.exists():
-        data = np.load(str(config.BOARD_HOMOGRAPHY_PATH))
+        data = np.load(str(config.BOARD_HOMOGRAPHY_PATH), allow_pickle=False)
         homography = data["homography"]
         print("Board homography loaded.")
     else:
@@ -217,8 +217,11 @@ def main():
                     geo_conf = det["confidence"]
 
                     # Confidence indicator
+                    geo_agrees = det.get("geo_agrees", True)
                     conf_marker = ""
-                    if geo_conf < config.GEO_CONF_MODERATE:
+                    if not geo_agrees:
+                        conf_marker = " [!geo]"
+                    elif geo_conf < config.GEO_CONF_MODERATE:
                         conf_marker = " [?]"
                     elif geo_conf < config.GEO_CONF_HIGH:
                         conf_marker = " [~]"

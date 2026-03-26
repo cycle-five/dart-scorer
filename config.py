@@ -42,6 +42,43 @@ BOARD_HOMOGRAPHY_PATH = PROJECT_ROOT / "data" / "board_homography.npz"
 CROP_ROI_PATH = PROJECT_ROOT / "data" / "crop_roi.npz"
 
 # ---------------------------------------------------------------------------
+# Training data
+# ---------------------------------------------------------------------------
+
+# Current dataset version — all collection and training uses this path.
+DATASET_VERSION = "v3"
+DATASET_DIR = PROJECT_ROOT / "data" / DATASET_VERSION
+DATASET_IMAGES_DIR = DATASET_DIR / "images"
+DATASET_LABELS_DIR = DATASET_DIR / "labels"
+DATASET_YAML_PATH = DATASET_DIR / "dataset.yaml"
+DATASET_ANNOTATIONS_PATH = DATASET_DIR / "annotations.jsonl"
+
+
+def training_frame_stem(timestamp_ms, undistorted, width, height):
+    """Build a training frame filename stem (no extension).
+
+    Format: YYYYMMDD_HHMMSS_fff_{undistort|raw}_{W}x{H}
+    Timestamps are unique — no frame counter needed.
+
+    Args:
+        timestamp_ms: time.time() * 1000 or similar epoch milliseconds.
+        undistorted: bool — whether lens undistortion was applied.
+        width: frame width in pixels.
+        height: frame height in pixels.
+
+    Returns:
+        Filename stem string, e.g. "20260325_143052_123_undistort_674x569"
+    """
+    import time as _time
+    t = timestamp_ms / 1000.0
+    lt = _time.localtime(t)
+    ms = int(timestamp_ms % 1000)
+    distort_tag = "undistort" if undistorted else "raw"
+    return (f"{_time.strftime('%Y%m%d_%H%M%S', lt)}_{ms:03d}"
+            f"_{distort_tag}_{width}x{height}")
+
+
+# ---------------------------------------------------------------------------
 # Checkerboard calibration
 # ---------------------------------------------------------------------------
 
