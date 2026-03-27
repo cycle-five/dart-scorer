@@ -598,6 +598,32 @@ def _draw_waveform(canvas, x, y, w, h, history, threshold, history_max):
             cv2.line(canvas, (x1, y1), (x2, y2), color, 1)
 
 
+def _resave_batch_labels(session, batch_frames, saved_stems, label_dir,
+                         board_center, edit_dart):
+    """Re-save label files after an annotation edit (label or tip position).
+
+    Only rewrites label files for frames that include the edited dart.
+    """
+    for fi in range(len(batch_frames)):
+        if fi >= len(saved_stems):
+            break
+        frame_anns = session.annotations[:fi + 1]
+        h_img, w_img = batch_frames[fi].shape[:2]
+        stem = saved_stems[fi]
+        label_name = f"{stem}.txt"
+        if fi + 1 >= edit_dart:
+            with open(label_dir / label_name, "w") as lf:
+                for (aax, aay, sseg) in frame_anns:
+                    bcx, bcy, bw, bh = auto_expand_bbox(
+                        aax, aay, w_img, h_img, board_center,
+                        frame=batch_frames[fi]
+                    )
+                    lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+            print(f"  Updated: {label_name}")
+    # Also update carry-forward
+    return list(session.annotations)
+
+
 def render_control_panel(
     state,
     video,
@@ -613,6 +639,7 @@ def render_control_panel(
     edit_text="",
     prediction_confidences=None,
     saved_stems=None,
+    needed_classes=None,
 ):
     cp_w, cp_h = 400, 380
     cp = np.zeros((cp_h, cp_w, 3), dtype=np.uint8)
@@ -780,7 +807,7 @@ def render_control_panel(
             cp_y += 22
         cv2.putText(
             cp,
-            "Pull darts  |  X=edit  |  ESC=discard batch",
+            "Pull darts  |  X=edit (label or tip)  |  ESC=discard",
             (10, cp_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.38,
@@ -867,6 +894,16 @@ def render_control_panel(
             cv2.putText(cp, display_stem, (10, cp_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, (100, 180, 100), 1)
             cp_y += 13
+
+    # Needed classes
+    if needed_classes:
+        cv2.putText(cp, "Need data:", (10, cp_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 150, 255), 1)
+        for count, name in needed_classes:
+            cv2.putText(cp, f"  {name}: {count}", (75, cp_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 150, 255), 1)
+            cp_y += 13
+        cp_y += 5
 
     # Controls
     cv2.putText(
@@ -1172,15 +1209,37 @@ def collect_data(
         except Exception as e:
             print(f"WARNING: Could not load YOLO model: {e}")
 
+    # Compute class distribution from existing labels for "needed" display
+    from collections import Counter as _Counter
+    class_counts = _Counter()
+    for lp in label_dir.glob("*.txt"):
+        with open(lp) as _f:
+            for _line in _f:
+                _parts = _line.strip().split()
+                if len(_parts) >= 5:
+                    class_counts[int(_parts[0])] += 1
+
+    from classes_v2 import CLASS_NAMES as _CLASS_NAMES, NUM_CLASSES as _NUM_CLS
+    def _get_needed_classes(n=3):
+        """Return the n classes with fewest samples."""
+        counts = [(class_counts.get(i, 0), _CLASS_NAMES[i]) for i in range(_NUM_CLS)]
+        counts.sort()
+        return counts[:n]
+
+    needed = _get_needed_classes()
+    print(f"\nClasses needing data most:")
+    for count, name in needed:
+        print(f"  {name}: {count} samples")
+
     win = "Collect Training Data"
     panel_win = "Control Panel"
     create_window(win, default_width=960, default_height=540)
     create_window(panel_win, default_width=400, default_height=380)
     cv2.setMouseCallback(win, _mouse_callback)
 
-    print(f"\n=== YOLO Training Data Collection (v2, 1-class detection) ===")
+    print(f"\n=== YOLO Training Data Collection (v3, 63-class) ===")
     print(f"Output: {outdir.resolve()}")
-    print(f"Continuing from frame {frame_counter}")
+    print(f"Existing frames: {sum(1 for _ in img_dir.glob('*.png'))}")
     print(f"Batch mode: throw up to 3 darts, then annotate all")
     print(f"Collect timeout: {collect_timeout}s after first dart")
     if yolo_model:
@@ -1400,8 +1459,12 @@ def collect_data(
 
             # --- Render ---
             if state in (UIState.ANNOTATING, UIState.REVIEW) and batch_frames:
-                # Show last frame (all darts visible) during annotating/review
-                show_idx = min(batch_index, len(batch_frames) - 1)
+                # ANNOTATING: show the frame being annotated
+                # REVIEW: always show the LAST frame (all darts visible)
+                if state == UIState.REVIEW:
+                    show_idx = len(batch_frames) - 1
+                else:
+                    show_idx = min(batch_index, len(batch_frames) - 1)
                 display = batch_frames[show_idx].copy()
             else:
                 display = frame.copy()
@@ -1440,6 +1503,7 @@ def collect_data(
                 edit_text,
                 prediction_confidences,
                 saved_stems=saved_stems,
+                needed_classes=needed,
             )
             cv2.imshow(panel_win, cp)
 
@@ -1555,6 +1619,11 @@ def collect_data(
                     with open(annotations_path, "a") as f:
                         f.write(json.dumps(entry) + "\n")
                     saved_stems.append(stem)
+                    for _, _, seg in session.annotations:
+                        cid = CLASS_TO_ID.get(seg)
+                        if cid is not None:
+                            class_counts[cid] += 1
+                    needed = _get_needed_classes()
                     frame_counter += 1
                     print(f"  Saved: {img_dir / fname}")
                     print(f"         {label_dir / label_name}")
@@ -1639,7 +1708,7 @@ def collect_data(
                 if key == ord("x") and edit_dart is None:
                     edit_dart = 0
                     edit_text = ""
-                    print("  Edit: press 1, 2, or 3 to re-label that dart")
+                    print("  Edit: press 1, 2, or 3 to select dart (then type label or click to move tip)")
 
                 elif edit_dart == 0:
                     # Waiting for dart number (1-based index into annotations list)
@@ -1649,8 +1718,9 @@ def collect_data(
                         if dart_idx < len(session.annotations):
                             edit_dart = dart_num
                             edit_text = ""
-                            cur = session.annotations[dart_idx][2]  # segment name
-                            print(f"  Editing dart {dart_num} ({cur}) — type new label + ENTER")
+                            cur_x, cur_y, cur_seg = session.annotations[dart_idx]
+                            print(f"  Dart {dart_num} selected ({cur_seg} at ({cur_x:.0f},{cur_y:.0f}))")
+                            print(f"    Type new label + ENTER, or click to move tip, ESC to cancel")
                         else:
                             print(f"  No dart {dart_num} in this round")
                             edit_dart = None
@@ -1659,8 +1729,47 @@ def collect_data(
                         print("  Edit cancelled")
 
                 elif edit_dart is not None and edit_dart >= 1:
-                    # Typing new label for a specific dart (edit_dart is 1-based)
-                    if key == 13:  # ENTER — confirm
+                    dart_idx = edit_dart - 1
+
+                    # Check for click to reposition tip
+                    if _auto_confirmed[0] or (session and session.click_point is not None):
+                        # A click happened — use it to reposition the tip
+                        if session.click_point is not None:
+                            new_x, new_y = session.click_point
+                            session.click_point = None
+                        elif _auto_confirmed[0]:
+                            # Auto-confirm click happened — last annotation was auto-added
+                            _auto_confirmed[0] = False
+                            # The auto-confirm added a new annotation; undo it and use the position
+                            if len(session.annotations) > len(previous_annotations):
+                                new_ann = session.annotations.pop()
+                                new_x, new_y = new_ann[0], new_ann[1]
+                            else:
+                                continue
+
+                        _, _, old_seg = session.annotations[dart_idx]
+                        # Re-guess segment from new position
+                        new_seg = _guess_segment_from_homography(
+                            new_x, new_y, session.homography, session.crop_offset
+                        )
+                        if new_seg and new_seg in CLASS_TO_ID:
+                            session.annotations[dart_idx] = (new_x, new_y, new_seg)
+                            info = parse_class_name(new_seg)
+                            print(f"  Dart {edit_dart} tip moved → ({new_x:.0f},{new_y:.0f}) {info['label']}")
+                        else:
+                            session.annotations[dart_idx] = (new_x, new_y, old_seg)
+                            print(f"  Dart {edit_dart} tip moved → ({new_x:.0f},{new_y:.0f}) (kept {old_seg})")
+
+                        # Re-save affected label files
+                        _resave_batch_labels(
+                            session, batch_frames, saved_stems, label_dir,
+                            board_center, edit_dart
+                        )
+                        previous_annotations = list(session.annotations)
+                        edit_dart = None
+                        edit_text = ""
+
+                    elif key == 13:  # ENTER — confirm typed label
                         seg = segment_shorthand(edit_text)
                         if seg is None:
                             print(f"  Invalid: '{edit_text}' — try again")
@@ -1669,26 +1778,14 @@ def collect_data(
                             print(f"  Unknown class: {seg}")
                             edit_text = ""
                         else:
-                            dart_idx = edit_dart - 1  # 0-based
                             ax, ay, _ = session.annotations[dart_idx]
                             session.annotations[dart_idx] = (ax, ay, seg)
                             info = parse_class_name(seg)
-                            print(f"  dart {edit_dart} → {info['label']}")
-                            # Re-save affected label files
-                            # Each frame N has annotations [d0..dN-1]
-                            for fi in range(len(batch_frames)):
-                                frame_anns = session.annotations[:fi + 1]
-                                h_img, w_img = batch_frames[fi].shape[:2]
-                                saved_idx = frame_counter - len(batch_frames) + fi
-                                label_name = f"frame_{saved_idx:05d}.txt"
-                                # Only rewrite if this frame includes the edited dart
-                                if fi + 1 >= edit_dart:
-                                    with open(label_dir / label_name, "w") as lf:
-                                        for (aax, aay, sseg) in frame_anns:
-                                            bcx, bcy, bw, bh = auto_expand_bbox(aax, aay, w_img, h_img, board_center, frame=batch_frames[fi])
-                                            lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
-                                    print(f"  Updated: {label_name}")
-                            # Update carry-forward
+                            print(f"  Dart {edit_dart} → {info['label']}")
+                            _resave_batch_labels(
+                                session, batch_frames, saved_stems, label_dir,
+                                board_center, edit_dart
+                            )
                             previous_annotations = list(session.annotations)
                             edit_dart = None
                             edit_text = ""

@@ -147,7 +147,7 @@ def restore_snapshot(name):
 # Balanced training
 # ---------------------------------------------------------------------------
 
-def create_balanced_subset(outdir="data/training", samples_per_class=5):
+def create_balanced_subset(outdir="data/training", samples_per_class=50):
     """Create a balanced subset of the training data.
 
     Returns path to a temporary dataset.yaml for the balanced subset.
@@ -287,10 +287,179 @@ def train_balanced(epochs=100, batch=16, imgsz=640, device=None, samples_per_cla
 
 
 # ---------------------------------------------------------------------------
+# Focused training (specific classes)
+# ---------------------------------------------------------------------------
+
+def create_focused_subset(focus_classes, min_others=0):
+    """Create a subset containing frames with specific classes.
+
+    Selects all frames that contain at least one of the focus classes.
+    Optionally includes a small number of other frames for stability.
+
+    Args:
+        focus_classes: List of class names (e.g. ["D3", "D11", "T10"]).
+        min_others: Minimum other frames to include (0 = focus only).
+
+    Returns:
+        Path to temporary dataset.yaml, or None on error.
+    """
+    import random
+
+    data_dir = DATASET_YAML.parent
+    img_dir = data_dir / "images"
+    label_dir = data_dir / "labels"
+    focus_dir = data_dir / "_focused"
+    focus_img = focus_dir / "images"
+    focus_lbl = focus_dir / "labels"
+
+    # Map focus class names to IDs
+    focus_ids = set()
+    for name in focus_classes:
+        cid = CLASS_TO_ID.get(name)
+        if cid is None:
+            print(f"WARNING: Unknown class '{name}', skipping")
+        else:
+            focus_ids.add(cid)
+
+    if not focus_ids:
+        print("ERROR: No valid focus classes specified")
+        return None
+
+    # Clean previous
+    if focus_dir.exists():
+        import shutil
+        shutil.rmtree(focus_dir)
+    focus_img.mkdir(parents=True)
+    focus_lbl.mkdir(parents=True)
+
+    # Scan labels to find frames containing focus classes
+    focus_stems = []
+    other_stems = []
+
+    for lp in sorted(label_dir.glob("*.txt")):
+        classes_in_file = set()
+        with open(lp) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    classes_in_file.add(int(parts[0]))
+
+        if classes_in_file & focus_ids:
+            focus_stems.append(lp.stem)
+        else:
+            other_stems.append(lp.stem)
+
+    # Add some background frames for stability
+    if min_others > 0 and other_stems:
+        random.shuffle(other_stems)
+        selected_others = other_stems[:min_others]
+    else:
+        selected_others = []
+
+    all_selected = focus_stems + selected_others
+
+    # Symlink files
+    for stem in all_selected:
+        for ext, src_dir, dst_dir in [(".png", img_dir, focus_img),
+                                       (".txt", label_dir, focus_lbl)]:
+            src = src_dir / f"{stem}{ext}"
+            dst = dst_dir / f"{stem}{ext}"
+            if src.exists() and not dst.exists():
+                dst.symlink_to(src.resolve())
+
+    # Create dataset.yaml
+    focus_yaml = focus_dir / "dataset.yaml"
+    lines = [
+        f"# Focused subset: {', '.join(focus_classes)}",
+        f"# {len(focus_stems)} focus frames + {len(selected_others)} background",
+        "",
+        f"path: {focus_dir.resolve()}",
+        "train: images",
+        "val: images",
+        "",
+        "names:",
+    ]
+    for i, name in enumerate(CLASS_NAMES):
+        lines.append(f"  {i}: {name}")
+    with open(focus_yaml, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    # Show stats
+    focus_counts = Counter()
+    for stem in focus_stems:
+        lp = label_dir / f"{stem}.txt"
+        with open(lp) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    cid = int(parts[0])
+                    if cid in focus_ids:
+                        focus_counts[CLASS_NAMES[cid]] += 1
+
+    print(f"\nFocused subset: {len(all_selected)} frames "
+          f"({len(focus_stems)} with target classes, {len(selected_others)} background)")
+    for name in focus_classes:
+        print(f"  {name}: {focus_counts.get(name, 0)} annotations")
+
+    return str(focus_yaml)
+
+
+def focus_train(focus_classes, epochs=100, batch=16, imgsz=640, device=None,
+                patience=50, min_background=20):
+    """Train focused on specific underrepresented classes."""
+    from ultralytics import YOLO
+
+    focus_yaml = create_focused_subset(focus_classes, min_others=min_background)
+    if focus_yaml is None:
+        return
+
+    # Start from current best
+    best_pt = RUNS_DIR / "detect" / "dartscorer" / "weights" / "best.pt"
+    if not best_pt.exists():
+        print("ERROR: No best.pt found. Run full training first.")
+        return
+
+    print(f"\nFine-tuning on focused subset (patience={patience})...")
+    train(
+        epochs=epochs,
+        batch=batch,
+        imgsz=imgsz,
+        weights="best",
+        device=device,
+        patience=patience,
+        dataset_yaml=focus_yaml,
+    )
+
+
+def auto_focus(n_weakest=5, **kwargs):
+    """Automatically focus on the N classes with fewest samples."""
+    label_dir = DATASET_YAML.parent / "labels"
+    counts = Counter()
+    for lp in label_dir.glob("*.txt"):
+        with open(lp) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    counts[int(parts[0])] += 1
+
+    # Find weakest classes
+    all_counts = [(counts.get(i, 0), CLASS_NAMES[i]) for i in range(NUM_CLASSES)]
+    all_counts.sort()
+    weakest = [name for _, name in all_counts[:n_weakest]]
+
+    print(f"Auto-focus: targeting {n_weakest} weakest classes:")
+    for count, name in all_counts[:n_weakest]:
+        print(f"  {name}: {count} samples")
+
+    focus_train(weakest, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Standard training
 # ---------------------------------------------------------------------------
 
-def train(epochs=100, batch=16, imgsz=640, resume=False, weights=None, device=None):
+def train(epochs=100, batch=16, imgsz=640, resume=False, weights=None, device=None,
+          patience=20, dataset_yaml=None):
     """Train YOLOv8 on the dartscorer dataset."""
     from ultralytics import YOLO
 
@@ -330,14 +499,14 @@ def train(epochs=100, batch=16, imgsz=640, resume=False, weights=None, device=No
         print("Training from pretrained YOLOv8n")
 
     train_args = dict(
-        data=str(DATASET_YAML),
+        data=str(dataset_yaml or DATASET_YAML),
         epochs=epochs,
         batch=batch,
         imgsz=imgsz,
         project=str(RUNS_DIR / "detect"),
         name="dartscorer",
         exist_ok=True,
-        patience=20,
+        patience=patience,
         save=True,
         save_period=10,
         plots=True,
@@ -404,6 +573,12 @@ def main():
                         help="List saved model snapshots")
     parser.add_argument("--restore", type=str, default=None,
                         help="Restore a snapshot as current best model")
+    parser.add_argument("--focus", type=str, default=None,
+                        help="Focus training on specific classes (comma-separated, e.g. D3,D11,T10)")
+    parser.add_argument("--auto-focus", type=int, default=None, metavar="N",
+                        help="Auto-focus on the N weakest classes")
+    parser.add_argument("--patience", type=int, default=20,
+                        help="Early stopping patience (default: 20, use higher for focus training)")
     args = parser.parse_args()
 
     if args.list_snapshots:
@@ -414,6 +589,25 @@ def main():
         restore_snapshot(args.restore)
     elif args.eval:
         evaluate()
+    elif args.focus:
+        classes = [c.strip() for c in args.focus.split(",")]
+        focus_train(
+            classes,
+            epochs=args.epochs,
+            batch=args.batch,
+            imgsz=args.imgsz,
+            device=args.device,
+            patience=args.patience,
+        )
+    elif args.auto_focus is not None:
+        auto_focus(
+            n_weakest=args.auto_focus,
+            epochs=args.epochs,
+            batch=args.batch,
+            imgsz=args.imgsz,
+            device=args.device,
+            patience=args.patience,
+        )
     elif args.balanced:
         train_balanced(
             epochs=args.epochs,
@@ -429,6 +623,7 @@ def main():
             resume=args.resume,
             weights=args.weights,
             device=args.device,
+            patience=args.patience,
         )
 
 
