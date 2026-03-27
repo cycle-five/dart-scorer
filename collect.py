@@ -612,6 +612,7 @@ def render_control_panel(
     edit_dart=None,
     edit_text="",
     prediction_confidences=None,
+    saved_stems=None,
 ):
     cp_w, cp_h = 400, 380
     cp = np.zeros((cp_h, cp_w, 3), dtype=np.uint8)
@@ -779,7 +780,7 @@ def render_control_panel(
             cp_y += 22
         cv2.putText(
             cp,
-            "Pull darts to continue  |  X=edit  |  R=discard",
+            "Pull darts  |  X=edit  |  ESC=discard batch",
             (10, cp_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.38,
@@ -846,14 +847,26 @@ def render_control_panel(
         else:
             cv2.putText(
                 cp,
-                "Click new dart tip",
+                "Click tip  |  B=bounced out  |  ESC=discard batch",
                 (10, cp_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.38,
                 (150, 150, 150),
                 1,
             )
     cp_y += 25
+
+    # Saved files this batch
+    if saved_stems:
+        cv2.putText(cp, f"Files ({len(saved_stems)}):", (10, cp_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 200, 100), 1)
+        cp_y += 15
+        for s in saved_stems[-3:]:  # show last 3 to fit
+            # Truncate stem to fit panel width
+            display_stem = s if len(s) < 45 else "..." + s[-42:]
+            cv2.putText(cp, display_stem, (10, cp_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (100, 180, 100), 1)
+            cp_y += 13
 
     # Controls
     cv2.putText(
@@ -1190,6 +1203,7 @@ def collect_data(
     collect_start = 0.0  # when first dart of batch was captured
     cooldown_start = 0.0
     edit_dart = None  # REVIEW edit state: None=not editing, 0=picking dart#, 1-3=typing
+    saved_stems = []  # stems of files saved in current batch (for display / discard)
     edit_text = ""
     prediction_confidences = {}  # cls_name -> confidence for display
     review_enter_time = 0.0  # when REVIEW state was entered
@@ -1272,8 +1286,9 @@ def collect_data(
                                          "n_darts": len(anns), "timestamp": time.time()}
                                 with open(annotations_path, "a") as f:
                                     f.write(json.dumps(entry) + "\n")
+                                saved_stems.append(stem)
                                 frame_counter += 1
-                                print(f"  Auto-saved: {fname} with {len(anns)} dart(s)")
+                                print(f"  Auto-saved: {img_dir / fname}")
                             previous_annotations = list(predicted[-1])
                             session = AnnotationSession(homography=homography,
                                                         previous_annotations=previous_annotations,
@@ -1338,6 +1353,7 @@ def collect_data(
                                      "n_darts": len(anns), "timestamp": time.time()}
                             with open(annotations_path, "a") as f:
                                 f.write(json.dumps(entry) + "\n")
+                            saved_stems.append(stem)
                             frame_counter += 1
                         previous_annotations = list(predicted[-1])
                         session = AnnotationSession(homography=homography,
@@ -1423,6 +1439,7 @@ def collect_data(
                 edit_dart,
                 edit_text,
                 prediction_confidences,
+                saved_stems=saved_stems,
             )
             cv2.imshow(panel_win, cp)
 
@@ -1537,8 +1554,10 @@ def collect_data(
                     }
                     with open(annotations_path, "a") as f:
                         f.write(json.dumps(entry) + "\n")
+                    saved_stems.append(stem)
                     frame_counter += 1
-                    print(f"  Saved: {fname} with {len(session.annotations)} dart(s)")
+                    print(f"  Saved: {img_dir / fname}")
+                    print(f"         {label_dir / label_name}")
 
                     # Carry forward and advance
                     previous_annotations = list(session.annotations)
@@ -1579,26 +1598,40 @@ def collect_data(
                             removed = session.undo()
                             if removed:
                                 print(f"  Undo: {removed[2]}")
-                        elif key == ord("r"):
-                            previous_annotations = []
-                            batch_frames = []
-                            batch_index = 0
-                            session = None
-                            _session_ref[0] = None
-                            if video:
-                                video.reset_calm_counter()
-                                state = UIState.PULL_DARTS
-                                cooldown_start = time.monotonic()
+                        elif key == ord("b"):
+                            # Bounce-out: this dart bounced off the board.
+                            # Skip this frame — no annotation, no saved file.
+                            dart_num = len(session.annotations) - session._carry_count + 1
+                            print(f"  Dart {dart_num} bounced out — skipping frame")
+                            batch_index += 1
+                            if batch_index < len(batch_frames):
+                                session = AnnotationSession(
+                                    homography=homography,
+                                    previous_annotations=list(session.annotations),
+                                    crop_offset=crop_offset,
+                                )
+                                _session_ref[0] = session
+                                print(f"  → Frame {batch_index + 1}/{len(batch_frames)}")
                             else:
-                                state = UIState.LISTENING
-                            print("  Round reset — pull darts")
-                        elif key == 27:  # ESC — discard batch
+                                state = UIState.REVIEW
+                                review_enter_time = time.monotonic()
+                                print("  All frames handled — pull darts or X to edit")
+                        elif key == 27:  # ESC — discard entire batch
+                            # Delete any files already saved for this batch
+                            if saved_stems:
+                                print(f"  Discarding {len(saved_stems)} saved file(s):")
+                                for s in saved_stems:
+                                    for p in [img_dir / f"{s}.png", label_dir / f"{s}.txt"]:
+                                        if p.exists():
+                                            p.unlink()
+                                            print(f"    Deleted: {p.name}")
+                                saved_stems.clear()
                             batch_frames = []
                             batch_index = 0
                             session = None
                             _session_ref[0] = None
                             state = UIState.LISTENING
-                            print("  Discarded — listening")
+                            print("  Batch discarded — listening")
 
             elif state == UIState.REVIEW:
                 # Show last frame with all annotations
@@ -1669,9 +1702,33 @@ def collect_data(
                     elif 32 <= key < 127:
                         edit_text += chr(key)
 
+                elif key == 27 and edit_dart is None:
+                    # ESC in REVIEW — discard entire batch (delete saved files)
+                    if saved_stems:
+                        print(f"  Discarding {len(saved_stems)} saved file(s):")
+                        for s in saved_stems:
+                            for p in [img_dir / f"{s}.png", label_dir / f"{s}.txt"]:
+                                if p.exists():
+                                    p.unlink()
+                                    print(f"    Deleted: {p.name}")
+                        saved_stems.clear()
+                    batch_frames = []
+                    batch_index = 0
+                    session = None
+                    _session_ref[0] = None
+                    edit_dart = None
+                    edit_text = ""
+                    state = UIState.LISTENING
+                    print("  Batch discarded — listening")
+
                 elif key == ord("r") or (edit_dart is None and video and video.saw_disturbance()
                                          and time.monotonic() - review_enter_time > 2.0):
-                    # Accept and move on
+                    # Accept and move on (normal completion)
+                    if saved_stems:
+                        print(f"  Round complete — saved {len(saved_stems)} frame(s):")
+                        for s in saved_stems:
+                            print(f"    {s}")
+                    saved_stems = []
                     edit_dart = None
                     edit_text = ""
                     prediction_confidences = {}
