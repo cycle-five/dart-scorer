@@ -618,7 +618,8 @@ def _resave_batch_labels(session, batch_frames, saved_stems, label_dir,
                         aax, aay, w_img, h_img, board_center,
                         frame=batch_frames[fi]
                     )
-                    lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                    cid = CLASS_TO_ID.get(sseg, 0)
+                    lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
             print(f"  Updated: {label_name}")
     # Also update carry-forward
     return list(session.annotations)
@@ -1339,7 +1340,8 @@ def collect_data(
                                 with open(label_dir / label_name, "w") as lf:
                                     for (ax, ay, seg) in anns:
                                         bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[fi])
-                                        lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                                        cid = CLASS_TO_ID.get(seg, 0)
+                                        lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                                 entry = {"filename": fname,
                                          "darts": [{"tip_x": ax, "tip_y": ay, "segment": seg} for (ax, ay, seg) in anns],
                                          "n_darts": len(anns), "timestamp": time.time()}
@@ -1406,7 +1408,8 @@ def collect_data(
                             with open(label_dir / label_name, "w") as lf:
                                 for (ax, ay, seg) in anns:
                                     bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[fi])
-                                    lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                                    cid = CLASS_TO_ID.get(seg, 0)
+                                    lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                             entry = {"filename": fname,
                                      "darts": [{"tip_x": ax, "tip_y": ay, "segment": seg} for (ax, ay, seg) in anns],
                                      "n_darts": len(anns), "timestamp": time.time()}
@@ -1606,7 +1609,8 @@ def collect_data(
                     with open(label_dir / label_name, "w") as lf:
                         for ax, ay, seg in session.annotations:
                             bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[batch_index])
-                            lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                            cid = CLASS_TO_ID.get(seg, 0)
+                            lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                     entry = {
                         "filename": fname,
                         "darts": [
@@ -1747,6 +1751,11 @@ def collect_data(
                             else:
                                 continue
 
+                        if dart_idx >= len(session.annotations):
+                            print(f"  Dart {edit_dart} not found — edit cancelled")
+                            edit_dart = None
+                            edit_text = ""
+                            continue
                         _, _, old_seg = session.annotations[dart_idx]
                         # Re-guess segment from new position
                         new_seg = _guess_segment_from_homography(
@@ -1770,6 +1779,11 @@ def collect_data(
                         edit_text = ""
 
                     elif key == 13:  # ENTER — confirm typed label
+                        if dart_idx >= len(session.annotations):
+                            print(f"  Dart {edit_dart} not found — edit cancelled")
+                            edit_dart = None
+                            edit_text = ""
+                            continue
                         seg = segment_shorthand(edit_text)
                         if seg is None:
                             print(f"  Invalid: '{edit_text}' — try again")
@@ -2369,7 +2383,8 @@ def label_offline(outdir=None, box_size=30):
                 with open(label_dir / label_name, "w") as lf:
                     for ax, ay, seg in session.annotations:
                         bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w, h, board_center=None, frame=frame)
-                        lf.write(f"0 {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                        cid = CLASS_TO_ID.get(seg, 0)
+                        lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
 
                 entry = {
                     "filename": img_path.name,

@@ -431,6 +431,244 @@ def focus_train(focus_classes, epochs=100, batch=16, imgsz=640, device=None,
     )
 
 
+class ModelInfo:
+    """Parsed info about a trained YOLO model."""
+
+    def __init__(self, weights_path=None):
+        self.weights_path = weights_path
+        self.size_mb = 0.0
+        self.last_modified = 0.0
+        self.num_classes = 0
+        self.num_parameters = 0
+        self.class_names = {}
+
+        # Training config (from args.yaml)
+        self.dataset = ""
+        self.epochs = 0
+        self.imgsz = 0
+        self.batch = 0
+        self.patience = 0
+
+        # Last training metrics (from results.csv)
+        self.actual_epochs = 0
+        self.precision = 0.0
+        self.recall = 0.0
+        self.map50 = 0.0
+        self.map50_95 = 0.0
+
+        self.has_stale_best = False  # last.pt newer than best.pt
+
+        if weights_path and Path(weights_path).exists():
+            self._load(Path(weights_path))
+
+    def _load(self, best_pt):
+        import time as _time
+        import yaml
+
+        self.weights_path = best_pt
+        self.size_mb = best_pt.stat().st_size / 1024 / 1024
+        self.last_modified = best_pt.stat().st_mtime
+
+        from ultralytics import YOLO
+        model = YOLO(str(best_pt))
+        self.num_classes = len(model.names)
+        self.class_names = dict(model.names)
+        self.num_parameters = sum(p.numel() for p in model.model.parameters())
+
+        # Training config
+        args_yaml = best_pt.parent.parent / "args.yaml"
+        if args_yaml.exists():
+            with open(args_yaml) as f:
+                args = yaml.safe_load(f)
+            self.dataset = args.get("data", "")
+            self.epochs = args.get("epochs", 0)
+            self.imgsz = args.get("imgsz", 0)
+            self.batch = args.get("batch", 0)
+            self.patience = args.get("patience", 0)
+
+        # Last training metrics
+        results_csv = best_pt.parent.parent / "results.csv"
+        if results_csv.exists():
+            with open(results_csv) as f:
+                lines = f.readlines()
+            if len(lines) >= 2:
+                header = lines[0].strip().split(",")
+                last = lines[-1].strip().split(",")
+                vals = dict(zip(header, last))
+                self.actual_epochs = len(lines) - 1
+                self.precision = float(vals.get("metrics/precision(B)", 0))
+                self.recall = float(vals.get("metrics/recall(B)", 0))
+                self.map50 = float(vals.get("metrics/mAP50(B)", 0))
+                self.map50_95 = float(vals.get("metrics/mAP50-95(B)", 0))
+
+        # Check if training continued past best
+        last_pt = best_pt.parent / "last.pt"
+        if last_pt.exists() and last_pt.stat().st_mtime > best_pt.stat().st_mtime:
+            self.has_stale_best = True
+
+    @property
+    def exists(self):
+        return self.weights_path is not None and Path(self.weights_path).exists()
+
+
+class DatasetInfo:
+    """Parsed info about a training dataset."""
+
+    def __init__(self, dataset_yaml=None):
+        self.path = None
+        self.yaml_path = dataset_yaml
+        self.n_images = 0
+        self.n_labels = 0
+        self.n_annotations = 0
+        self.classes_covered = 0
+        self.class_counts = Counter()  # class_id -> count
+        self.snapshots = []  # list of dicts with name, timestamp, metrics
+
+        if dataset_yaml and Path(dataset_yaml).exists():
+            self._load(Path(dataset_yaml))
+
+    def _load(self, yaml_path):
+        self.yaml_path = yaml_path
+        self.path = yaml_path.parent
+
+        img_dir = self.path / "images"
+        label_dir = self.path / "labels"
+        self.n_images = (len(list(img_dir.glob("*.png")))
+                         + len(list(img_dir.glob("*.jpg"))))
+        self.n_labels = len(list(label_dir.glob("*.txt")))
+
+        self.class_counts = Counter()
+        self.n_annotations = 0
+        for lp in label_dir.glob("*.txt"):
+            with open(lp) as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        self.class_counts[int(parts[0])] += 1
+                        self.n_annotations += 1
+
+        self.classes_covered = sum(
+            1 for i in range(NUM_CLASSES) if self.class_counts.get(i, 0) > 0
+        )
+
+        # Load snapshots
+        self.snapshots = []
+        if SNAPSHOTS_DIR.exists():
+            for s in sorted(SNAPSHOTS_DIR.iterdir()):
+                meta_path = s / "meta.json"
+                if meta_path.exists():
+                    with open(meta_path) as f:
+                        self.snapshots.append(json.load(f))
+
+    @property
+    def avg_per_class(self):
+        return self.n_annotations / NUM_CLASSES if NUM_CLASSES > 0 else 0
+
+    @property
+    def min_per_class(self):
+        return min((self.class_counts.get(i, 0) for i in range(NUM_CLASSES)),
+                    default=0)
+
+    @property
+    def max_per_class(self):
+        return max((self.class_counts.get(i, 0) for i in range(NUM_CLASSES)),
+                    default=0)
+
+    def weakest(self, n=5):
+        """Return the n classes with fewest samples as (count, name) pairs."""
+        all_counts = [(self.class_counts.get(i, 0), CLASS_NAMES[i])
+                      for i in range(NUM_CLASSES)]
+        all_counts.sort()
+        return all_counts[:n]
+
+    def strongest(self, n=5):
+        """Return the n classes with most samples as (count, name) pairs."""
+        all_counts = [(self.class_counts.get(i, 0), CLASS_NAMES[i])
+                      for i in range(NUM_CLASSES)]
+        all_counts.sort(reverse=True)
+        return all_counts[:n]
+
+
+def get_model_info():
+    """Load and return ModelInfo for the current best model."""
+    best_pt = RUNS_DIR / "detect" / "dartscorer" / "weights" / "best.pt"
+    return ModelInfo(best_pt)
+
+
+def get_dataset_info():
+    """Load and return DatasetInfo for the current dataset."""
+    return DatasetInfo(DATASET_YAML)
+
+
+def print_info():
+    """Print detailed info about the current model and dataset."""
+    import time as _time
+
+    mi = get_model_info()
+    di = get_dataset_info()
+
+    print("=" * 60)
+    print("MODEL INFO")
+    print("=" * 60)
+
+    if not mi.exists:
+        print("\n  No trained model found.")
+        print(f"  Expected at: {RUNS_DIR / 'detect' / 'dartscorer' / 'weights' / 'best.pt'}")
+        print("  Run 'python train.py' to train.")
+    else:
+        print(f"\n  Weights:      {mi.weights_path}")
+        print(f"  Size:         {mi.size_mb:.1f} MB")
+        print(f"  Last updated: {_time.ctime(mi.last_modified)}")
+        print(f"  Classes:      {mi.num_classes}")
+        print(f"  Parameters:   {mi.num_parameters:,}")
+
+        if mi.dataset:
+            print(f"\n  Training config:")
+            print(f"    Dataset:    {mi.dataset}")
+            print(f"    Epochs:     {mi.epochs}")
+            print(f"    Image size: {mi.imgsz}")
+            print(f"    Batch:      {mi.batch}")
+            print(f"    Patience:   {mi.patience}")
+
+        if mi.actual_epochs > 0:
+            print(f"\n  Last training results (epoch {mi.actual_epochs}):")
+            print(f"    Precision:  {mi.precision:.3f}")
+            print(f"    Recall:     {mi.recall:.3f}")
+            print(f"    mAP50:      {mi.map50:.3f}")
+            print(f"    mAP50-95:   {mi.map50_95:.3f}")
+
+        if mi.has_stale_best:
+            print(f"\n  NOTE: last.pt is newer than best.pt — training may have")
+            print(f"        continued past the best checkpoint.")
+
+    print(f"\n{'=' * 60}")
+    print("DATASET INFO")
+    print("=" * 60)
+    print(f"\n  Path:     {di.path}")
+    print(f"  YAML:     {di.yaml_path}")
+    print(f"  Images:   {di.n_images}")
+    print(f"  Labels:   {di.n_labels}")
+    print(f"  Annotations: {di.n_annotations}")
+    print(f"  Classes covered: {di.classes_covered}/{NUM_CLASSES}")
+
+    if di.n_annotations > 0:
+        print(f"  Per class: min={di.min_per_class}  avg={di.avg_per_class:.0f}  max={di.max_per_class}")
+
+        print(f"\n  5 weakest classes:")
+        for count, name in di.weakest(5):
+            print(f"    {name:>8s}: {count}")
+
+        print(f"\n  5 strongest classes:")
+        for count, name in di.strongest(5):
+            print(f"    {name:>8s}: {count}")
+
+    if di.snapshots:
+        print(f"\n  Snapshots: {len(di.snapshots)}")
+        for snap in di.snapshots:
+            m = snap.get("metrics", {})
+            print(f"    {snap['name']:<25s} {snap['timestamp']:<20s} mAP50={m.get('mAP50', '?')}")
+
+
 def auto_focus(n_weakest=5, **kwargs):
     """Automatically focus on the N classes with fewest samples."""
     label_dir = DATASET_YAML.parent / "labels"
@@ -565,6 +803,8 @@ def main():
                         help="Device (e.g. 'cpu', '0', '0,1')")
     parser.add_argument("--eval", action="store_true",
                         help="Evaluate model instead of training")
+    parser.add_argument("--info", action="store_true",
+                        help="Show model and dataset info")
     parser.add_argument("--balanced", action="store_true",
                         help="Two-phase: balanced pre-train then fine-tune on all")
     parser.add_argument("--snapshot", type=str, default=None,
@@ -587,6 +827,8 @@ def main():
         snapshot(args.snapshot)
     elif args.restore:
         restore_snapshot(args.restore)
+    elif args.info:
+        print_info()
     elif args.eval:
         evaluate()
     elif args.focus:
