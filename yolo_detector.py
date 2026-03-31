@@ -210,14 +210,16 @@ class YOLODartDetector:
             else:
                 tip = (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-            # Primary classification from YOLO (63-class model)
+            # Primary classification from YOLO (62-class model)
             cls_name = ID_TO_CLASS.get(cls_id, "unknown")
             info = parse_class_name(cls_name) if cls_name != "unknown" else None
             segment = info["segment"] if info else "unknown"
             score = info["score"] if info else 0
             label = info["label"] if info else "Unknown"
 
-            # Geometry as confidence check (not primary classification)
+            # Geometry as confidence check + MISS override
+            # MISS is not a YOLO class — it's determined by geometry
+            # (radius > DOUBLE_OUTER_RADIUS in canonical mm space)
             geo_classification = None
             geo_confidence = 1.0  # default: trust YOLO
             geo_agrees = True
@@ -229,7 +231,15 @@ class YOLODartDetector:
                     can = apply_homography(tip_full, self.homography)
                     geo_classification = classify_dart(can[0], can[1])
                     geo_confidence = geo_classification["confidence"]
-                    geo_agrees = geo_classification["segment"] == segment
+
+                    # MISS override: geometry says outside the board
+                    if geo_classification["ring"] == "miss":
+                        segment = "MISS"
+                        score = 0
+                        label = "Miss → 0"
+                        geo_agrees = True
+                    else:
+                        geo_agrees = geo_classification["segment"] == segment
                 except Exception:
                     pass
 

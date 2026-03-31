@@ -32,13 +32,14 @@ SECTOR_ADJACENCY = {
     for i in range(20)
 }
 
-# Build segment list (63 segments).
+# Build segment list (62 segments — MISS is handled by geometry, not YOLO).
 SEGMENTS = []
 for s in SECTORS:
     for r in RINGS:
         SEGMENTS.append(f"{r}{s}")
 SEGMENTS.extend(BULLS)
-SEGMENTS.append("MISS")
+# MISS is NOT a YOLO class — it's determined by geometry (r > DOUBLE_OUTER_RADIUS).
+# Keeping it out of the class list prevents training data imbalance.
 
 # Class list — each segment is its own class (index == class ID).
 CLASS_NAMES = list(SEGMENTS)
@@ -47,7 +48,7 @@ CLASS_NAMES = list(SEGMENTS)
 CLASS_TO_ID = {name: i for i, name in enumerate(CLASS_NAMES)}
 ID_TO_CLASS = {i: name for i, name in enumerate(CLASS_NAMES)}
 
-NUM_CLASSES = len(CLASS_NAMES)  # 63
+NUM_CLASSES = len(CLASS_NAMES)  # 62
 
 
 # ---------------------------------------------------------------------------

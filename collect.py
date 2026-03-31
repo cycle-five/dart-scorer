@@ -614,11 +614,13 @@ def _resave_batch_labels(session, batch_frames, saved_stems, label_dir,
         if fi + 1 >= edit_dart:
             with open(label_dir / label_name, "w") as lf:
                 for (aax, aay, sseg) in frame_anns:
+                    if sseg not in CLASS_TO_ID:
+                        continue  # skip MISS — handled by geometry, not YOLO
                     bcx, bcy, bw, bh = auto_expand_bbox(
                         aax, aay, w_img, h_img, board_center,
                         frame=batch_frames[fi]
                     )
-                    cid = CLASS_TO_ID.get(sseg, 0)
+                    cid = CLASS_TO_ID[sseg]
                     lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
             print(f"  Updated: {label_name}")
     # Also update carry-forward
@@ -1340,8 +1342,9 @@ def collect_data(
                                 with open(label_dir / label_name, "w") as lf:
                                     for (ax, ay, seg) in anns:
                                         bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[fi])
-                                        cid = CLASS_TO_ID.get(seg, 0)
-                                        lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                                        if seg not in CLASS_TO_ID:
+                                            continue  # skip MISS
+                                        lf.write(f"{CLASS_TO_ID[seg]} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                                 entry = {"filename": fname,
                                          "darts": [{"tip_x": ax, "tip_y": ay, "segment": seg} for (ax, ay, seg) in anns],
                                          "n_darts": len(anns), "timestamp": time.time()}
@@ -1407,9 +1410,10 @@ def collect_data(
                             label_name = f"{stem}.txt"
                             with open(label_dir / label_name, "w") as lf:
                                 for (ax, ay, seg) in anns:
+                                    if seg not in CLASS_TO_ID:
+                                        continue  # skip MISS
                                     bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[fi])
-                                    cid = CLASS_TO_ID.get(seg, 0)
-                                    lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                                    lf.write(f"{CLASS_TO_ID[seg]} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                             entry = {"filename": fname,
                                      "darts": [{"tip_x": ax, "tip_y": ay, "segment": seg} for (ax, ay, seg) in anns],
                                      "n_darts": len(anns), "timestamp": time.time()}
@@ -1608,9 +1612,10 @@ def collect_data(
                     label_name = f"{stem}.txt"
                     with open(label_dir / label_name, "w") as lf:
                         for ax, ay, seg in session.annotations:
+                            if seg not in CLASS_TO_ID:
+                                continue  # skip MISS
                             bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w_img, h_img, board_center, frame=batch_frames[batch_index])
-                            cid = CLASS_TO_ID.get(seg, 0)
-                            lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                            lf.write(f"{CLASS_TO_ID[seg]} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
                     entry = {
                         "filename": fname,
                         "darts": [
@@ -2382,9 +2387,10 @@ def label_offline(outdir=None, box_size=30):
                 label_name = img_path.stem + ".txt"
                 with open(label_dir / label_name, "w") as lf:
                     for ax, ay, seg in session.annotations:
+                        if seg not in CLASS_TO_ID:
+                            continue  # skip MISS
                         bcx, bcy, bw, bh = auto_expand_bbox(ax, ay, w, h, board_center=None, frame=frame)
-                        cid = CLASS_TO_ID.get(seg, 0)
-                        lf.write(f"{cid} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
+                        lf.write(f"{CLASS_TO_ID[seg]} {bcx:.6f} {bcy:.6f} {bw:.6f} {bh:.6f}\n")
 
                 entry = {
                     "filename": img_path.name,
