@@ -111,26 +111,16 @@ def find_disagreements(conf_threshold=0.5):
                 "cx": pcx, "cy": pcy,
             })
 
-        # Greedy match: for each label, find closest prediction
-        used_preds = set()
-        for lab in labels:
-            total_annotations += 1
-            best_dist = float("inf")
-            best_pred = None
-            best_idx = -1
+        # Optimal matching using Hungarian algorithm (scipy)
+        # Greedy nearest-neighbor fails when darts are close together
+        from scipy.optimize import linear_sum_assignment
 
-            for i, pred in enumerate(preds):
-                if i in used_preds:
-                    continue
-                dist = ((lab["cx"] - pred["cx"]) ** 2 +
-                        (lab["cy"] - pred["cy"]) ** 2) ** 0.5
-                if dist < best_dist:
-                    best_dist = dist
-                    best_pred = pred
-                    best_idx = i
+        n_lab = len(labels)
+        n_pred = len(preds)
 
-            if best_pred is None or best_dist > 0.15:
-                # No matching prediction
+        if n_pred == 0:
+            for lab in labels:
+                total_annotations += 1
                 disagreements.append({
                     "file": img_path.name,
                     "stem": img_path.stem,
@@ -142,25 +132,68 @@ def find_disagreements(conf_threshold=0.5):
                     "type": "undetected",
                     "cx": lab["cx"], "cy": lab["cy"],
                 })
-                continue
+            continue
 
-            used_preds.add(best_idx)
+        # Build cost matrix (distance between each label and prediction)
+        cost = np.zeros((n_lab, n_pred))
+        for li, lab in enumerate(labels):
+            for pi, pred in enumerate(preds):
+                cost[li, pi] = ((lab["cx"] - pred["cx"]) ** 2 +
+                                (lab["cy"] - pred["cy"]) ** 2) ** 0.5
 
-            if best_pred["class_id"] != lab["class_id"]:
-                # Class mismatch
+        row_ind, col_ind = linear_sum_assignment(cost)
+
+        matched_labels = set()
+        for li, pi in zip(row_ind, col_ind):
+            lab = labels[li]
+            pred = preds[pi]
+            dist = cost[li, pi]
+            total_annotations += 1
+            matched_labels.add(li)
+
+            if dist > 0.15:
+                # Matched but too far — treat as undetected
                 disagreements.append({
                     "file": img_path.name,
                     "stem": img_path.stem,
                     "label_class": lab["class_name"],
                     "label_id": lab["class_id"],
-                    "pred_class": best_pred["class_name"],
-                    "pred_id": best_pred["class_id"],
-                    "pred_conf": best_pred["conf"],
+                    "pred_class": "(not detected)",
+                    "pred_id": -1,
+                    "pred_conf": 0.0,
+                    "type": "undetected",
+                    "cx": lab["cx"], "cy": lab["cy"],
+                })
+            elif pred["class_id"] != lab["class_id"]:
+                disagreements.append({
+                    "file": img_path.name,
+                    "stem": img_path.stem,
+                    "label_class": lab["class_name"],
+                    "label_id": lab["class_id"],
+                    "pred_class": pred["class_name"],
+                    "pred_id": pred["class_id"],
+                    "pred_conf": pred["conf"],
                     "type": "mismatch",
                     "cx": lab["cx"], "cy": lab["cy"],
                 })
             else:
                 total_matches += 1
+
+        # Unmatched labels (more labels than predictions)
+        for li, lab in enumerate(labels):
+            if li not in matched_labels:
+                total_annotations += 1
+                disagreements.append({
+                    "file": img_path.name,
+                    "stem": img_path.stem,
+                    "label_class": lab["class_name"],
+                    "label_id": lab["class_id"],
+                    "pred_class": "(not detected)",
+                    "pred_id": -1,
+                    "pred_conf": 0.0,
+                    "type": "undetected",
+                    "cx": lab["cx"], "cy": lab["cy"],
+                })
 
     # Sort by confidence (highest confidence disagreements = most likely mislabels)
     disagreements.sort(key=lambda d: -d["pred_conf"])

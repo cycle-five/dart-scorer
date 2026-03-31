@@ -21,7 +21,7 @@ import numpy as np
 
 # Project imports
 sys.path.insert(0, str(Path(__file__).parent))
-from classes import ID_TO_CLASS, CLASS_TO_ID, SEGMENTS, ORDINALS
+from classes_v2 import ID_TO_CLASS, CLASS_TO_ID, SEGMENTS, NUM_CLASSES, parse_class_name
 
 PORT = 8765
 import config as _config
@@ -36,7 +36,7 @@ LABELS_DIR = _config.DATASET_LABELS_DIR
 def load_label_index():
     """Return dict: class_id -> list of (stem, boxes) where boxes is list of
     (class_id, cx, cy, w, h) for all annotations in that image."""
-    index = {cid: [] for cid in ID_TO_CLASS}
+    index = {cid: [] for cid in range(NUM_CLASSES)}
     label_files = sorted(LABELS_DIR.glob("*.txt"))
     for lf in label_files:
         stem = lf.stem
@@ -74,11 +74,13 @@ def count_per_class():
 # Image annotation (OpenCV)
 # ---------------------------------------------------------------------------
 
-def render_annotated_thumbnail(stem, target_class_id, thumb_w=300):
-    """Load image, draw all bboxes, highlight target class. Return JPEG bytes."""
+def render_annotated_image(stem, target_class_id, max_width=None):
+    """Load image, draw all bboxes, highlight target class. Return JPEG bytes.
+
+    If max_width is None, return full-resolution image.
+    """
     img_path = IMAGES_DIR / f"{stem}.png"
     if not img_path.exists():
-        # Try jpg
         img_path = IMAGES_DIR / f"{stem}.jpg"
     if not img_path.exists():
         return None
@@ -119,21 +121,24 @@ def render_annotated_thumbnail(stem, target_class_id, thumb_w=300):
         if cid == target_class_id:
             cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
             label = ID_TO_CLASS.get(cid, str(cid))
-            # Background for text
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            info = parse_class_name(label)
+            display = f"{label} ({info['label']})"
+            (tw, th), _ = cv2.getTextSize(display, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             ty = max(y1 - 4, th + 2)
             cv2.rectangle(overlay, (x1, ty - th - 2), (x1 + tw + 2, ty + 2), (0, 200, 0), -1)
-            cv2.putText(overlay, label, (x1 + 1, ty),
+            cv2.putText(overlay, display, (x1 + 1, ty),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
-    img = cv2.addWeighted(overlay, 1.0, img, 0.0, 0)
+    img = overlay
 
-    # Resize to thumbnail width
-    scale = thumb_w / w
-    new_h = int(h * scale)
-    img = cv2.resize(img, (thumb_w, new_h), interpolation=cv2.INTER_AREA)
+    # Resize if max_width specified
+    if max_width and w > max_width:
+        scale = max_width / w
+        new_h = int(h * scale)
+        img = cv2.resize(img, (max_width, new_h), interpolation=cv2.INTER_AREA)
 
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    quality = 85 if max_width else 92
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         return None
     return bytes(buf)
@@ -146,16 +151,17 @@ COLOR_RED    = "#c0392b"
 COLOR_ORANGE = "#e67e22"
 COLOR_YELLOW = "#f1c40f"
 COLOR_GREEN  = "#27ae60"
-COLOR_NONE   = "#2c3e50"
+COLOR_DARK_GREEN = "#1e8449"
 
 def count_color(n):
     if n == 0:    return COLOR_RED
-    if n <= 3:    return COLOR_ORANGE
-    if n <= 10:   return COLOR_YELLOW
-    return COLOR_GREEN
+    if n <= 5:    return COLOR_ORANGE
+    if n <= 20:   return COLOR_YELLOW
+    if n <= 50:   return COLOR_GREEN
+    return COLOR_DARK_GREEN
 
 def text_color(n):
-    if n <= 10:   return "#000"
+    if n <= 20:   return "#000"
     return "#fff"
 
 HTML_HEADER = """<!DOCTYPE html>
@@ -176,22 +182,33 @@ HTML_HEADER = """<!DOCTYPE html>
   .legend { display: flex; gap: 12px; margin-bottom: 14px; font-size: 0.8rem; flex-wrap: wrap; }
   .legend-item { display: flex; align-items: center; gap: 5px; }
   .legend-swatch { width: 16px; height: 16px; border-radius: 3px; flex-shrink: 0; }
-  table.heatmap { border-collapse: collapse; font-size: 0.75rem; }
-  table.heatmap th { padding: 4px 8px; background: #2a2a4a; color: #ccc; font-weight: normal; }
+  table.heatmap { border-collapse: collapse; font-size: 0.8rem; }
+  table.heatmap th { padding: 6px 10px; background: #2a2a4a; color: #ccc; font-weight: normal; }
   table.heatmap td { padding: 0; }
-  table.heatmap td a { display: block; width: 58px; height: 32px; line-height: 32px;
+  table.heatmap td a { display: block; width: 64px; height: 36px; line-height: 36px;
                         text-align: center; font-weight: bold; border: 1px solid #1a1a2e; }
   table.heatmap td a:hover { opacity: 0.8; filter: brightness(1.2); text-decoration: none; }
-  .segment-label { padding: 4px 8px; background: #2a2a4a; color: #ccc;
-                   text-align: right; white-space: nowrap; font-size: 0.75rem; }
+  .ring-label { padding: 6px 10px; background: #2a2a4a; color: #ccc;
+                text-align: left; white-space: nowrap; }
   .thumb-grid { display: flex; flex-wrap: wrap; gap: 12px; }
   .thumb-card { background: #2a2a4a; border-radius: 6px; overflow: hidden;
-                border: 1px solid #444; }
+                border: 1px solid #444; cursor: pointer; }
+  .thumb-card:hover { border-color: #a0c4ff; }
   .thumb-card img { display: block; width: 300px; height: auto; }
   .thumb-label { padding: 4px 8px; font-size: 0.7rem; color: #aaa;
                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
                  max-width: 300px; }
   .empty { color: #888; font-style: italic; padding: 20px 0; }
+
+  /* Lightbox for full-size image zoom */
+  .lightbox { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+              background: rgba(0,0,0,0.9); z-index: 1000; justify-content: center;
+              align-items: center; cursor: zoom-out; }
+  .lightbox.active { display: flex; }
+  .lightbox img { max-width: 95vw; max-height: 95vh; object-fit: contain; }
+  .lightbox-caption { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+                      color: #aaa; font-size: 0.85rem; background: rgba(0,0,0,0.7);
+                      padding: 6px 16px; border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -199,42 +216,71 @@ HTML_HEADER = """<!DOCTYPE html>
 
 HTML_FOOTER = "</body></html>\n"
 
+LIGHTBOX_JS = """
+<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+  <img id="lightbox-img" src="">
+  <div class="lightbox-caption" id="lightbox-caption"></div>
+</div>
+<script>
+function openLightbox(thumbUrl, stem, classId) {
+  // Request full-size image
+  var fullUrl = '/image/' + classId + '/' + encodeURIComponent(stem);
+  document.getElementById('lightbox-img').src = fullUrl;
+  document.getElementById('lightbox-caption').textContent = stem;
+  document.getElementById('lightbox').classList.add('active');
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('active');
+  document.getElementById('lightbox-img').src = '';
+}
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeLightbox();
+});
+</script>
+"""
+
 
 def heatmap_page(counts):
     total_images = len(list(LABELS_DIR.glob("*.txt")))
     total_labeled = sum(counts.values())
+    covered = sum(1 for v in counts.values() if v > 0)
 
     parts = [HTML_HEADER]
-    parts.append(f"<h1>Dart Label Analyzer — Heatmap</h1>\n")
+    parts.append(f"<h1>Dart Label Analyzer — {NUM_CLASSES} classes</h1>\n")
     parts.append(f'<div class="stats">'
                  f'{total_images} images &nbsp;|&nbsp; '
-                 f'{total_labeled} labeled instances across {len([v for v in counts.values() if v>0])} classes'
+                 f'{total_labeled} annotations &nbsp;|&nbsp; '
+                 f'{covered}/{NUM_CLASSES} classes covered'
                  f'</div>\n')
     parts.append('<div class="legend">\n')
     for color, label in [
-        (COLOR_RED,    "0 samples"),
-        (COLOR_ORANGE, "1–3 samples"),
-        (COLOR_YELLOW, "4–10 samples"),
-        (COLOR_GREEN,  "10+ samples"),
+        (COLOR_RED,        "0"),
+        (COLOR_ORANGE,     "1–5"),
+        (COLOR_YELLOW,     "6–20"),
+        (COLOR_GREEN,      "21–50"),
+        (COLOR_DARK_GREEN, "50+"),
     ]:
         parts.append(f'<div class="legend-item">'
                      f'<div class="legend-swatch" style="background:{color}"></div>'
                      f'{label}</div>\n')
     parts.append('</div>\n')
 
+    # Build heatmap: rows = sectors (1-20, then bulls), columns = rings (S, D, T)
+    RINGS = ["S", "D", "T"]
+    SECTORS = list(range(1, 21))
+
     parts.append('<table class="heatmap">\n')
-    # Header row: ordinals
-    parts.append('<thead><tr><th>Segment</th>')
-    for d in ORDINALS:
-        parts.append(f'<th>d{d}</th>')
+    parts.append('<thead><tr><th>Sector</th>')
+    for ring in RINGS:
+        parts.append(f'<th>{ring}</th>')
     parts.append('</tr></thead>\n<tbody>\n')
 
-    for seg in SEGMENTS:
+    for sector in SECTORS:
         parts.append('<tr>')
-        parts.append(f'<td class="segment-label">{seg}</td>')
-        for d in ORDINALS:
-            class_name = f"d{d}_{seg}"
-            cid = CLASS_TO_ID.get(class_name)
+        parts.append(f'<td class="ring-label">{sector}</td>')
+        for ring in RINGS:
+            seg = f"{ring}{sector}"
+            cid = CLASS_TO_ID.get(seg)
             n = counts.get(cid, 0) if cid is not None else 0
             bg = count_color(n)
             fg = text_color(n)
@@ -248,6 +294,22 @@ def heatmap_page(counts):
             parts.append(f'<td>{cell}</td>')
         parts.append('</tr>\n')
 
+    # Bulls row
+    parts.append('<tr>')
+    parts.append(f'<td class="ring-label">Bull</td>')
+    for seg in ["S_BULL", "D_BULL"]:
+        cid = CLASS_TO_ID.get(seg)
+        n = counts.get(cid, 0) if cid is not None else 0
+        bg = count_color(n)
+        fg = text_color(n)
+        if cid is not None and n > 0:
+            cell = f'<a href="/class/{cid}" style="background:{bg};color:{fg}">{n}</a>'
+        else:
+            cell = f'<a href="#" style="background:{bg};color:{fg};cursor:default">{n}</a>'
+        parts.append(f'<td>{cell}</td>')
+    parts.append('<td></td>')  # empty cell for T column
+    parts.append('</tr>\n')
+
     parts.append('</tbody></table>\n')
     parts.append(HTML_FOOTER)
     return "".join(parts).encode("utf-8")
@@ -255,26 +317,29 @@ def heatmap_page(counts):
 
 def class_detail_page(class_id):
     class_name = ID_TO_CLASS.get(class_id, f"class_{class_id}")
+    info = parse_class_name(class_name)
     entries = get_index().get(class_id, [])
 
     parts = [HTML_HEADER]
     parts.append(f'<a class="back" href="/">← Back to heatmap</a>\n')
-    parts.append(f'<h2>Class: {class_name} &nbsp;({len(entries)} images)</h2>\n')
+    parts.append(f'<h2>{class_name} — {info["label"]} &nbsp;({len(entries)} images)</h2>\n')
 
     if not entries:
         parts.append('<p class="empty">No labeled images for this class.</p>\n')
     else:
         parts.append('<div class="thumb-grid">\n')
         for stem, _boxes in entries:
-            img_url = f"/thumb/{class_id}/{urllib.parse.quote(stem)}"
+            thumb_url = f"/thumb/{class_id}/{urllib.parse.quote(stem)}"
             parts.append(
-                f'<div class="thumb-card">'
-                f'<img src="{img_url}" loading="lazy" width="300">'
+                f'<div class="thumb-card" onclick="openLightbox(\'{thumb_url}\', '
+                f'\'{stem}\', {class_id})">'
+                f'<img src="{thumb_url}" loading="lazy" width="300">'
                 f'<div class="thumb-label">{stem}</div>'
                 f'</div>\n'
             )
         parts.append('</div>\n')
 
+    parts.append(LIGHTBOX_JS)
     parts.append(HTML_FOOTER)
     return "".join(parts).encode("utf-8")
 
@@ -298,10 +363,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
+        path = self.path.split("?")[0]  # strip query string
 
-        # ----- Heatmap (root) -----
+        # ----- Root: heatmap -----
         if path == "/":
             counts = count_per_class()
             body = heatmap_page(counts)
@@ -311,18 +375,15 @@ class Handler(BaseHTTPRequestHandler):
         # ----- Class detail: /class/<id> -----
         if path.startswith("/class/"):
             try:
-                cid = int(path[len("/class/"):])
+                class_id = int(path[len("/class/"):])
             except ValueError:
-                self.send_error(400, "Bad class id")
+                self.send_error(400, "Invalid class ID")
                 return
-            if cid not in ID_TO_CLASS:
-                self.send_error(404, "Unknown class id")
-                return
-            body = class_detail_page(cid)
+            body = class_detail_page(class_id)
             self.send_response_with_body(200, "text/html; charset=utf-8", body)
             return
 
-        # ----- Annotated thumbnail: /thumb/<class_id>/<stem> -----
+        # ----- Thumbnail: /thumb/<class_id>/<stem> -----
         if path.startswith("/thumb/"):
             rest = path[len("/thumb/"):]
             slash = rest.find("/")
@@ -339,50 +400,57 @@ class Handler(BaseHTTPRequestHandler):
             if ".." in stem or "/" in stem or "\\" in stem or "\x00" in stem:
                 self.send_error(400, "Invalid filename")
                 return
-            jpeg = render_annotated_thumbnail(stem, cid)
+            jpeg = render_annotated_image(stem, cid, max_width=300)
             if jpeg is None:
                 self.send_error(404, "Image not found or could not render")
                 return
             self.send_response_with_body(200, "image/jpeg", jpeg)
             return
 
-        # ----- Raw source image: /image/<stem> -----
+        # ----- Full-size image: /image/<class_id>/<stem> -----
         if path.startswith("/image/"):
-            stem = urllib.parse.unquote(path[len("/image/"):])
+            rest = path[len("/image/"):]
+            slash = rest.find("/")
+            if slash < 0:
+                self.send_error(400, "Bad image path")
+                return
+            try:
+                cid = int(rest[:slash])
+            except ValueError:
+                self.send_error(400, "Bad class id")
+                return
+            stem = urllib.parse.unquote(rest[slash + 1:])
             # Sanitize: reject path traversal attempts
             if ".." in stem or "/" in stem or "\\" in stem or "\x00" in stem:
                 self.send_error(400, "Invalid filename")
                 return
-            img_path = IMAGES_DIR / f"{stem}.png"
-            if not img_path.exists():
-                img_path = IMAGES_DIR / f"{stem}.jpg"
-            if not img_path.exists():
+            jpeg = render_annotated_image(stem, cid, max_width=None)
+            if jpeg is None:
                 self.send_error(404, "Image not found")
                 return
-            data = img_path.read_bytes()
-            ct = "image/png" if str(img_path).endswith(".png") else "image/jpeg"
-            self.send_response_with_body(200, ct, data)
+            self.send_response_with_body(200, "image/jpeg", jpeg)
             return
 
         self.send_error(404, "Not found")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    print(f"Loading label index from {LABELS_DIR} ...", flush=True)
-    # Pre-load so first request is fast
+def main():
+    print(f"Loading label index from {LABELS_DIR}...")
+    get_index()
     counts = count_per_class()
-    n_classes = sum(1 for v in counts.values() if v > 0)
     total = sum(counts.values())
-    print(f"  {total} labeled instances across {n_classes} / {len(ID_TO_CLASS)} classes", flush=True)
+    covered = sum(1 for v in counts.values() if v > 0)
+    print(f"  {total} annotations across {covered}/{NUM_CLASSES} classes")
 
     server = HTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"\nServing at http://localhost:{PORT}/", flush=True)
-    print("Press Ctrl+C to stop.\n", flush=True)
+    print(f"\nLabel Analyzer running at http://localhost:{PORT}")
+    print("Press Ctrl+C to stop.\n")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
