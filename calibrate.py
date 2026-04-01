@@ -335,8 +335,10 @@ def calibrate_board(cap, debug=False, use_undistort=True):
 
     # --- Load crop ROI (optional) ---
     crop_roi = load_crop_roi()
+    crop_rotation = load_crop_rotation()
     if crop_roi is not None:
-        print(f"Applying crop ROI: ({crop_roi[0]}, {crop_roi[1]}) {crop_roi[2]}x{crop_roi[3]}")
+        rot_str = f" rot={crop_rotation}°" if crop_rotation else ""
+        print(f"Applying crop ROI: ({crop_roi[0]}, {crop_roi[1]}) {crop_roi[2]}x{crop_roi[3]}{rot_str}")
 
     print("\n=== Board Calibration (Manual 21-Point) ===")
     print("Position camera so the full dartboard is visible.")
@@ -357,7 +359,7 @@ def calibrate_board(cap, debug=False, use_undistort=True):
 
             if lens_params is not None:
                 frame = undistort_frame(frame, *lens_params)
-            frame = apply_crop(frame, crop_roi)
+            frame = apply_crop(frame, crop_roi, crop_rotation)
             display = frame.copy()
 
             cv2.putText(display, "Press SPACE to capture frame for calibration",
@@ -597,12 +599,30 @@ def load_crop_roi():
     return tuple(int(v) for v in roi)
 
 
-def apply_crop(frame, crop_roi):
-    """Crop a frame to the saved ROI. Returns cropped frame."""
+def load_crop_rotation():
+    """Load and return the crop rotation (0, 90, 180, 270) or 0 if not set."""
+    path = config.CROP_ROI_PATH
+    if not path.exists():
+        return 0
+    data = np.load(str(path), allow_pickle=False)
+    if "rotation" in data:
+        return int(data["rotation"])
+    return 0
+
+
+def apply_crop(frame, crop_roi, rotation=0):
+    """Crop and optionally rotate a frame. Returns processed frame."""
     if crop_roi is None:
         return frame
     x, y, w, h = crop_roi
-    return frame[y:y+h, x:x+w].copy()
+    cropped = frame[y:y+h, x:x+w].copy()
+    if rotation == 90:
+        cropped = cv2.rotate(cropped, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation == 180:
+        cropped = cv2.rotate(cropped, cv2.ROTATE_180)
+    elif rotation == 270:
+        cropped = cv2.rotate(cropped, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return cropped
 
 
 _crop_dragging = False
@@ -636,6 +656,7 @@ def calibrate_crop(cap, debug=False):
     print("Draw a rectangle around the dartboard area.")
     print("Controls:")
     print("  Click+drag  Draw crop rectangle")
+    print("  W           Cycle rotation (0° → 90° → 180° → 270°)")
     print("  ENTER       Accept and save")
     print("  R           Reset rectangle")
     print("  Q           Abort")
@@ -648,13 +669,15 @@ def calibrate_crop(cap, debug=False):
     _crop_rect = None
     _crop_dragging = False
     _crop_start = None
+    crop_rotation = load_crop_rotation()
 
     # Load existing crop for reference
     existing_roi = load_crop_roi()
     if existing_roi is not None:
         x, y, w, h = existing_roi
         _crop_rect = (x, y, x + w, y + h)
-        print(f"Existing crop: ({x}, {y}) {w}x{h} — adjust or ENTER to keep")
+        rot_str = f" rot={crop_rotation}°" if crop_rotation else ""
+        print(f"Existing crop: ({x}, {y}) {w}x{h}{rot_str} — adjust or ENTER to keep")
 
     try:
         while True:
@@ -687,11 +710,29 @@ def calibrate_crop(cap, debug=False):
 
                 cv2.rectangle(display, (rx1, ry1), (rx2, ry2), (0, 255, 0), 2)
                 size_text = f"{rx2 - rx1}x{ry2 - ry1}"
+                if crop_rotation:
+                    size_text += f" rot={crop_rotation}\u00b0"
                 cv2.putText(display, size_text, (rx1, ry1 - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            cv2.putText(display, "Draw rectangle around dartboard | ENTER=save  R=reset  Q=abort",
-                        (10, h_frame - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                # Show rotation preview in corner
+                if crop_rotation:
+                    preview = frame[ry1:ry2, rx1:rx2].copy()
+                    preview = apply_crop(frame, (rx1, ry1, rx2-rx1, ry2-ry1), crop_rotation)
+                    ph, pw = preview.shape[:2]
+                    preview_max = 150
+                    if pw > preview_max or ph > preview_max:
+                        scale = preview_max / max(pw, ph)
+                        preview = cv2.resize(preview, (int(pw*scale), int(ph*scale)))
+                    ph, pw = preview.shape[:2]
+                    display[5:5+ph, w_frame-pw-5:w_frame-5] = preview
+                    cv2.putText(display, f"Preview ({crop_rotation}\u00b0)",
+                                (w_frame-pw-5, 5+ph+15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+            rot_text = f"  W=rotate({crop_rotation}\u00b0)" if crop_rotation else "  W=rotate"
+            cv2.putText(display, f"Draw rectangle | ENTER=save  R=reset{rot_text}  Q=abort",
+                        (10, h_frame - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
             cv2.imshow(window, display)
             key = cv2.waitKey(30) & 0xFF
@@ -703,7 +744,12 @@ def calibrate_crop(cap, debug=False):
 
             elif key == ord('r'):
                 _crop_rect = None
+                crop_rotation = 0
                 print("  Rectangle reset")
+
+            elif key == ord('w'):
+                crop_rotation = (crop_rotation + 90) % 360
+                print(f"  Rotation: {crop_rotation}°")
 
             elif key in (13, 10):  # ENTER
                 if _crop_rect is None:
@@ -727,8 +773,10 @@ def calibrate_crop(cap, debug=False):
                 roi = np.array([rx1, ry1, crop_w, crop_h], dtype=np.int32)
                 save_path = config.CROP_ROI_PATH
                 save_path.parent.mkdir(parents=True, exist_ok=True)
-                np.savez(str(save_path), crop_roi=roi)
-                print(f"Crop ROI saved: ({rx1}, {ry1}) {crop_w}x{crop_h}")
+                np.savez(str(save_path), crop_roi=roi,
+                         rotation=np.array(crop_rotation, dtype=np.int32))
+                rot_str = f" rotation={crop_rotation}°" if crop_rotation else ""
+                print(f"Crop ROI saved: ({rx1}, {ry1}) {crop_w}x{crop_h}{rot_str}")
                 print(f"  Saved to {save_path}")
 
                 cv2.destroyWindow(window)

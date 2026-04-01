@@ -124,13 +124,15 @@ def main():
         print("Run: uv run python calibrate.py --board")
 
     # --- Crop ROI ---
-    from calibrate import open_camera, load_crop_roi, apply_crop
+    from calibrate import open_camera, load_crop_roi, load_crop_rotation, apply_crop
     crop_roi = load_crop_roi()
+    crop_rotation = load_crop_rotation()
     crop_offset = (0, 0)
     if crop_roi is not None:
         x, y, w, h = crop_roi
         crop_offset = (x, y)
-        print(f"Crop ROI: ({x}, {y}) {w}x{h}")
+        rot_str = f" rot={crop_rotation}°" if crop_rotation else ""
+        print(f"Crop ROI: ({x}, {y}) {w}x{h}{rot_str}")
 
     # --- Load YOLO model (resolution-aware) ---
     weights = args.weights
@@ -198,7 +200,7 @@ def main():
             # Optional undistortion + crop
             if lens_params is not None:
                 frame = undistort_frame(frame, *lens_params)
-            frame = apply_crop(frame, crop_roi)
+            frame = apply_crop(frame, crop_roi, crop_rotation)
 
             display = frame.copy()
 

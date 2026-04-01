@@ -1148,6 +1148,7 @@ def collect_data(
         load_lens_params,
         undistort_frame,
         load_crop_roi,
+        load_crop_rotation,
         apply_crop,
     )
 
@@ -1162,10 +1163,12 @@ def collect_data(
         print("WARNING: No lens params found, running without undistortion")
 
     crop_roi = load_crop_roi()
+    crop_rotation = load_crop_rotation()
     crop_offset = (0, 0)  # homography calibrated in cropped space, no offset needed
     if crop_roi is not None:
         x, y, w, h = crop_roi
-        print(f"Crop ROI: ({x}, {y}) {w}x{h}")
+        rot_str = f" rot={crop_rotation}°" if crop_rotation else ""
+        print(f"Crop ROI: ({x}, {y}) {w}x{h}{rot_str}")
 
     homography = None
     board_center = None  # board center in crop-pixel space for bbox expansion
@@ -1280,7 +1283,7 @@ def collect_data(
             frame = raw
             if lens_params is not None:
                 frame = undistort_frame(raw, *lens_params)
-            frame = apply_crop(frame, crop_roi)
+            frame = apply_crop(frame, crop_roi, crop_rotation)
 
             if video:
                 video.update(frame)
@@ -1903,6 +1906,7 @@ def capture_only(
         load_lens_params,
         undistort_frame,
         load_crop_roi,
+        load_crop_rotation,
         apply_crop,
     )
 
@@ -1950,7 +1954,7 @@ def capture_only(
             frame = raw
             if lens_params is not None:
                 frame = undistort_frame(raw, *lens_params)
-            frame = apply_crop(frame, crop_roi)
+            frame = apply_crop(frame, crop_roi, crop_rotation)
 
             if video:
                 video.update(frame)

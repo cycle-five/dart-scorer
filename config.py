@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(os.path.dirname(__file__))
 # ---------------------------------------------------------------------------
 
 # V4L2 device node for the eMeet C950 HD webcam
-CAMERA_DEVICE = "/dev/video2"
+CAMERA_DEVICE = "/dev/video0"
 
 # Capture resolution — 1024x576 MJPG is near 1:1 with YOLO's 640px input.
 # The eMeet C950 sensor upscales to 1080p with no real detail gain.
