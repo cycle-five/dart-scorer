@@ -105,24 +105,115 @@ CALIBRATION_DELAY = 1.0  # seconds
 # noted)
 # ---------------------------------------------------------------------------
 
-# Radius of the inner bull (double bull / bullseye) — scores 50 points
-INNER_BULL_RADIUS = 6.35  # mm
+# WDF standard radii — measured to wire BASE (board surface).
+# These are the true scoring boundaries.
+INNER_BULL_RADIUS_STANDARD = 6.35  # mm
+OUTER_BULL_RADIUS_STANDARD = 15.9  # mm
+TRIPLE_INNER_RADIUS_STANDARD = 99.0  # mm
+TRIPLE_OUTER_RADIUS_STANDARD = 107.0  # mm
+DOUBLE_INNER_RADIUS_STANDARD = 162.0  # mm
+DOUBLE_OUTER_RADIUS_STANDARD = 170.0  # mm
 
-# Radius of the outer bull (single bull) — scores 25 points
-OUTER_BULL_RADIUS = 15.9  # mm
+# Wire protrusion height — wires stick up ~0.8-1.6mm from the sisal surface.
+# At non-perpendicular camera angles, this causes parallax: the wire TOPS
+# (visible to the camera) appear shifted from the wire BASES (scoring boundary).
+# Set to 0 to disable parallax correction.
+WIRE_HEIGHT_MM = 1.2  # mm (~1/32" to 1/16")
 
-# Inside edge of the triple (treble) ring
-TRIPLE_INNER_RADIUS = 99.0  # mm
+# Parallax-corrected radii — these are what the camera actually sees.
+# Updated at runtime by apply_parallax_correction() when homography is loaded.
+# Default to standard values (no correction = perpendicular camera).
+INNER_BULL_RADIUS = INNER_BULL_RADIUS_STANDARD
+OUTER_BULL_RADIUS = OUTER_BULL_RADIUS_STANDARD
+TRIPLE_INNER_RADIUS = TRIPLE_INNER_RADIUS_STANDARD
+TRIPLE_OUTER_RADIUS = TRIPLE_OUTER_RADIUS_STANDARD
+DOUBLE_INNER_RADIUS = DOUBLE_INNER_RADIUS_STANDARD
+DOUBLE_OUTER_RADIUS = DOUBLE_OUTER_RADIUS_STANDARD
 
-# Outside edge of the triple ring
-TRIPLE_OUTER_RADIUS = 107.0  # mm
 
-# Inside edge of the double ring
-DOUBLE_INNER_RADIUS = 162.0  # mm
+def apply_parallax_correction(homography=None):
+    """Compute parallax-corrected ring radii from camera angle.
 
-# Outside edge of the double ring — also the playable outer boundary of the
-# board (radius = 170 mm → diameter = 340 mm)
-DOUBLE_OUTER_RADIUS = 170.0  # mm
+    The camera sees wire TOPS, not wire bases. At non-perpendicular angles,
+    wire tops appear shifted outward (away from center) by:
+        shift = wire_height * tan(camera_angle)
+
+    The shift direction is radially outward because the wire is above the
+    surface — from the camera's perspective, the wire top projects further
+    from center than the wire base.
+
+    This function estimates the camera tilt from the homography and adjusts
+    all ring boundary radii accordingly. The effect is position-dependent
+    (varies across the board), but we use a uniform correction based on
+    the dominant camera tilt angle since the variation is small for typical
+    mounting angles.
+
+    Call this after loading the homography (e.g., at scorer/collector startup).
+    """
+    global INNER_BULL_RADIUS, OUTER_BULL_RADIUS
+    global TRIPLE_INNER_RADIUS, TRIPLE_OUTER_RADIUS
+    global DOUBLE_INNER_RADIUS, DOUBLE_OUTER_RADIUS
+
+    if homography is None or WIRE_HEIGHT_MM <= 0:
+        return 0.0  # no correction
+
+    import math
+    import numpy as np
+
+    try:
+        # Estimate camera tilt by measuring perspective distortion
+        # Map canonical board edge points back to camera space
+        cx, cy = CANONICAL_CENTER
+        r = DOUBLE_OUTER_RADIUS_STANDARD
+        pts_can = np.array(
+            [
+                [cx, cy - r],  # top
+                [cx + r, cy],  # right
+                [cx, cy + r],  # bottom
+                [cx - r, cy],  # left
+            ],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
+
+        H_inv = np.linalg.inv(homography)
+        pts_cam = cv2.perspectiveTransform(pts_can, H_inv)
+
+        # Measure edge lengths in camera space
+        top = pts_cam[0][0]
+        right = pts_cam[1][0]
+        bottom = pts_cam[2][0]
+        left = pts_cam[3][0]
+
+        top_edge = np.linalg.norm(right - top)
+        bottom_edge = np.linalg.norm(bottom - left)
+        left_edge = np.linalg.norm(top - left)
+        right_edge = np.linalg.norm(right - bottom)
+
+        # Camera tilt angle from perspective ratio
+        vert_ratio = min(top_edge, bottom_edge) / max(top_edge, bottom_edge)
+        horiz_ratio = min(left_edge, right_edge) / max(left_edge, right_edge)
+
+        # Use the more oblique axis
+        ratio = min(vert_ratio, horiz_ratio)
+        tilt_angle = math.acos(min(1.0, ratio))  # radians
+
+        # Wire parallax shift (mm)
+        shift = WIRE_HEIGHT_MM * math.tan(tilt_angle)
+
+        # Apply correction: wire tops appear shifted OUTWARD from center
+        # All ring radii increase slightly (what the camera sees is the
+        # wire top, which projects further from center than the base)
+        INNER_BULL_RADIUS = INNER_BULL_RADIUS_STANDARD + shift
+        OUTER_BULL_RADIUS = OUTER_BULL_RADIUS_STANDARD + shift
+        TRIPLE_INNER_RADIUS = TRIPLE_INNER_RADIUS_STANDARD + shift
+        TRIPLE_OUTER_RADIUS = TRIPLE_OUTER_RADIUS_STANDARD + shift
+        DOUBLE_INNER_RADIUS = DOUBLE_INNER_RADIUS_STANDARD + shift
+        DOUBLE_OUTER_RADIUS = DOUBLE_OUTER_RADIUS_STANDARD + shift
+
+        return shift
+
+    except Exception:
+        return 0.0
 
 # Side length of the square canonical top-down image in pixels.
 # Chosen so that 1 pixel ≈ 1 mm at the board surface, giving

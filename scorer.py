@@ -118,7 +118,11 @@ def main():
     if config.BOARD_HOMOGRAPHY_PATH.exists():
         data = np.load(str(config.BOARD_HOMOGRAPHY_PATH), allow_pickle=False)
         homography = data["homography"]
-        print("Board homography loaded.")
+        shift = config.apply_parallax_correction(homography)
+        if shift > 0:
+            print(f"Board homography loaded (parallax correction: {shift:.2f}mm)")
+        else:
+            print("Board homography loaded.")
     else:
         print("WARNING: No board homography found. Scoring will not work.")
         print("Run: uv run python calibrate.py --board")

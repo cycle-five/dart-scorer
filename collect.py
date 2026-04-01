@@ -1175,7 +1175,11 @@ def collect_data(
     if config.BOARD_HOMOGRAPHY_PATH.exists():
         hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH), allow_pickle=False)
         homography = hom_data["homography"]
-        print("Board homography loaded — segment guess enabled")
+        shift = config.apply_parallax_correction(homography)
+        if shift > 0:
+            print(f"Board homography loaded — segment guess enabled (parallax: {shift:.2f}mm)")
+        else:
+            print("Board homography loaded — segment guess enabled")
         # Compute board center in crop-pixel space (inverse homography from canonical center)
         try:
             H_inv = np.linalg.inv(homography)
@@ -2198,7 +2202,11 @@ def label_offline(outdir=None, box_size=30):
     if config.BOARD_HOMOGRAPHY_PATH.exists():
         hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH), allow_pickle=False)
         homography = hom_data["homography"]
-        print("Board homography loaded — segment guess enabled")
+        shift = config.apply_parallax_correction(homography)
+        if shift > 0:
+            print(f"Board homography loaded — segment guess enabled (parallax: {shift:.2f}mm)")
+        else:
+            print("Board homography loaded — segment guess enabled")
 
     crop_offset = (0, 0)  # homography calibrated in cropped space
 
