@@ -482,12 +482,12 @@ class AnnotationSession:
     def handle_click(self, x, y):
         """Process a click. Auto-confirms if homography provides a guess."""
         guess = _guess_segment_from_homography(x, y, self.homography, self.crop_offset)
-        if guess and guess in CLASS_TO_ID:
+        if guess and (guess in CLASS_TO_ID or guess == "MISS"):
             # Auto-confirm: add annotation directly, no ENTER needed
             dart_num = len(self.annotations) + 1
             self.annotations.append((x, y, guess))
-            info = parse_class_name(guess)
-            self.last_auto_msg = f"dart {dart_num} {guess} — {info['label']}"
+            label = "Miss → 0" if guess == "MISS" else parse_class_name(guess)["label"]
+            self.last_auto_msg = f"dart {dart_num} {guess} — {label}"
             self.click_point = None
             self.text_input = ""
             self.guess_segment = ""
@@ -505,15 +505,15 @@ class AnnotationSession:
             msg = f"Invalid segment: '{self.text_input}'"
             self.text_input = ""
             return False, msg
-        if seg not in CLASS_TO_ID:
+        if seg not in CLASS_TO_ID and seg != "MISS":
             msg = f"Unknown class: {seg}"
             self.text_input = ""
             return False, msg
         px, py = self.click_point
         dart_num = len(self.annotations) + 1
         self.annotations.append((px, py, seg))
-        info = parse_class_name(seg)
-        msg = f"dart {dart_num} {seg} at ({px}, {py}) — {info['label']}"
+        label = "Miss → 0" if seg == "MISS" else parse_class_name(seg)["label"]
+        msg = f"dart {dart_num} {seg} at ({px}, {py}) — {label}"
         self.click_point = None
         self.text_input = ""
         self.guess_segment = ""
@@ -1800,14 +1800,14 @@ def collect_data(
                         if seg is None:
                             print(f"  Invalid: '{edit_text}' — try again")
                             edit_text = ""
-                        elif seg not in CLASS_TO_ID:
+                        elif seg not in CLASS_TO_ID and seg != "MISS":
                             print(f"  Unknown class: {seg}")
                             edit_text = ""
                         else:
                             ax, ay, _ = session.annotations[dart_idx]
                             session.annotations[dart_idx] = (ax, ay, seg)
-                            info = parse_class_name(seg)
-                            print(f"  Dart {edit_dart} → {info['label']}")
+                            label = "Miss → 0" if seg == "MISS" else parse_class_name(seg)["label"]
+                            print(f"  Dart {edit_dart} → {label}")
                             _resave_batch_labels(
                                 session, batch_frames, saved_stems, label_dir,
                                 board_center, edit_dart
