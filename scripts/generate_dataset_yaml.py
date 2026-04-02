@@ -9,8 +9,8 @@ Usage:
 """
 
 from pathlib import Path
-from classes_v2 import CLASS_NAMES, NUM_CLASSES
-import config
+from dartscorer.classes_v2 import CLASS_NAMES, NUM_CLASSES
+from dartscorer import config
 
 
 def generate(outdir=None):

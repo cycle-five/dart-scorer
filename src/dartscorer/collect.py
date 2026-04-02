@@ -31,9 +31,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import cv2
 import numpy as np
-import config
-import board
-from classes_v2 import (
+from dartscorer import config
+from dartscorer import board
+from dartscorer.classes_v2 import (
     CLASS_TO_ID,
     CLASS_NAMES,
     NUM_CLASSES,
@@ -43,8 +43,8 @@ from classes_v2 import (
     ring_from_segment,
     sector_from_segment,
 )
-from audio_trigger import DartAudioTrigger
-from window_manager import create_window, save_window_sizes
+from dartscorer.audio_trigger import DartAudioTrigger
+from dartscorer.window_manager import create_window, save_window_sizes
 
 
 # ---------------------------------------------------------------------------
@@ -1143,7 +1143,7 @@ def collect_data(
     global _undistort_active, _frame_resolution
     frame_counter = 0  # kept for HUD display only
 
-    from calibrate import (
+    from dartscorer.calibrate import (
         open_camera,
         load_lens_params,
         undistort_frame,
@@ -1229,7 +1229,7 @@ def collect_data(
                 if len(_parts) >= 5:
                     class_counts[int(_parts[0])] += 1
 
-    from classes_v2 import CLASS_NAMES as _CLASS_NAMES, NUM_CLASSES as _NUM_CLS
+    from dartscorer.classes_v2 import CLASS_NAMES as _CLASS_NAMES, NUM_CLASSES as _NUM_CLS
     def _get_needed_classes(n=3):
         """Return the n classes with fewest samples."""
         counts = [(class_counts.get(i, 0), _CLASS_NAMES[i]) for i in range(_NUM_CLS)]
@@ -1905,7 +1905,7 @@ def capture_only(
 
     frame_counter = 0  # display counter only
 
-    from calibrate import (
+    from dartscorer.calibrate import (
         open_camera,
         load_lens_params,
         undistort_frame,
@@ -2452,7 +2452,7 @@ def label_offline(outdir=None, box_size=30):
 # CLI
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Collect YOLO dart training data")
     sub = parser.add_subparsers(dest="mode", help="Mode")
 
@@ -2519,3 +2519,7 @@ if __name__ == "__main__":
                 settle_delay=args.settle_delay,
                 collect_timeout=args.collect_timeout,
             )
+
+
+if __name__ == "__main__":
+    main()

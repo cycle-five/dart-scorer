@@ -12,9 +12,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-import config
-from board import classify_dart, apply_homography
-from classes_v2 import ID_TO_CLASS, parse_class_name, NUM_CLASSES
+from dartscorer import config
+from dartscorer.board import classify_dart, apply_homography
+from dartscorer.classes_v2 import ID_TO_CLASS, parse_class_name, NUM_CLASSES
 
 
 RUNS_DIR = config.PROJECT_ROOT / "runs"

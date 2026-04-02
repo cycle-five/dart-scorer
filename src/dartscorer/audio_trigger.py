@@ -21,7 +21,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import numpy as np
-import config
+from dartscorer import config
 
 AUDIO_DATA_DIR = config.PROJECT_ROOT / "data" / "audio"
 MODEL_PATH = AUDIO_DATA_DIR / "dart_classifier.pkl"

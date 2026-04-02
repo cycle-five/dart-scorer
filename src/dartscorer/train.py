@@ -24,8 +24,8 @@ import time
 from pathlib import Path
 from collections import Counter, defaultdict
 
-import config
-from classes_v2 import NUM_CLASSES, ID_TO_CLASS, CLASS_TO_ID, CLASS_NAMES, parse_class_name
+from dartscorer import config
+from dartscorer.classes_v2 import NUM_CLASSES, ID_TO_CLASS, CLASS_TO_ID, CLASS_NAMES, parse_class_name
 
 
 DATASET_YAML = config.DATASET_YAML_PATH

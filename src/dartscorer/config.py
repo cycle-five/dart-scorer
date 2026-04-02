@@ -12,7 +12,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Project root — every path below is anchored here
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(os.path.dirname(__file__))
+PROJECT_ROOT = Path(os.path.dirname(__file__)).parent.parent
 
 # ---------------------------------------------------------------------------
 # Camera

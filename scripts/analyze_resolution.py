@@ -27,7 +27,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 import cv2
 import numpy as np
 
-import config
+from dartscorer import config
 
 
 # ---------------------------------------------------------------------------

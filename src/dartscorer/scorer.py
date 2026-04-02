@@ -26,8 +26,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import cv2
 import numpy as np
-import config
-from yolo_detector import YOLODartDetector
+from dartscorer import config
+from dartscorer.yolo_detector import YOLODartDetector
 
 
 class State(Enum):
@@ -128,7 +128,7 @@ def main():
         print("Run: uv run python calibrate.py --board")
 
     # --- Crop ROI ---
-    from calibrate import open_camera, load_crop_roi, load_crop_rotation, apply_crop
+    from dartscorer.calibrate import open_camera, load_crop_roi, load_crop_rotation, apply_crop
     crop_roi = load_crop_roi()
     crop_rotation = load_crop_rotation()
     crop_offset = (0, 0)
@@ -142,7 +142,7 @@ def main():
     weights = args.weights
     if weights is None:
         # Auto-select best model for current crop resolution
-        from yolo_detector import find_best_weights
+        from dartscorer.yolo_detector import find_best_weights
         weights = find_best_weights()
         if weights:
             print(f"Auto-selected model: {weights.parent.parent.name}")
@@ -163,7 +163,7 @@ def main():
     # --- Optional lens undistortion ---
     lens_params = None
     if not args.no_undistort and config.LENS_PARAMS_PATH.exists():
-        from calibrate import load_lens_params, undistort_frame
+        from dartscorer.calibrate import load_lens_params, undistort_frame
         lens_params = load_lens_params()
         print("Lens undistortion enabled.")
 

@@ -18,8 +18,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import cv2
 import numpy as np
-from classes_v2 import ID_TO_CLASS, CLASS_NAMES, SEGMENTS, NUM_CLASSES, parse_class_name
-import config
+from dartscorer.classes_v2 import ID_TO_CLASS, CLASS_NAMES, SEGMENTS, NUM_CLASSES, parse_class_name
+from dartscorer import config
 
 
 def load_class_counts(outdir=None):

@@ -8,9 +8,9 @@ Run: uv run python -m pytest test_board.py -v
 import math
 import pytest
 import numpy as np
-import config
-from board import pixel_to_polar, get_sector, get_ring, score_dart, apply_homography
-from classes_v2 import segment_shorthand, parse_class_name, make_class_name, CLASS_TO_ID, NUM_CLASSES
+from dartscorer import config
+from dartscorer.board import pixel_to_polar, get_sector, get_ring, score_dart, apply_homography
+from dartscorer.classes_v2 import segment_shorthand, parse_class_name, make_class_name, CLASS_TO_ID, NUM_CLASSES
 
 
 # ---------------------------------------------------------------------------

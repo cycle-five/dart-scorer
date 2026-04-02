@@ -20,11 +20,10 @@ import cv2
 import numpy as np
 
 # Project imports
-sys.path.insert(0, str(Path(__file__).parent))
-from classes_v2 import ID_TO_CLASS, CLASS_TO_ID, SEGMENTS, NUM_CLASSES, parse_class_name
+from dartscorer.classes_v2 import ID_TO_CLASS, CLASS_TO_ID, SEGMENTS, NUM_CLASSES, parse_class_name
+from dartscorer import config as _config
 
 PORT = 8765
-import config as _config
 DATA_DIR = _config.DATASET_DIR
 IMAGES_DIR = _config.DATASET_IMAGES_DIR
 LABELS_DIR = _config.DATASET_LABELS_DIR

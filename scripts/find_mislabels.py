@@ -22,8 +22,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 import cv2
 import numpy as np
 
-import config
-from classes_v2 import CLASS_NAMES, CLASS_TO_ID, ID_TO_CLASS, NUM_CLASSES, parse_class_name
+from dartscorer import config
+from dartscorer.classes_v2 import CLASS_NAMES, CLASS_TO_ID, ID_TO_CLASS, NUM_CLASSES, parse_class_name
 
 
 def find_disagreements(conf_threshold=0.5):

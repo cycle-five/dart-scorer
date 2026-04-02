@@ -1,7 +1,7 @@
 [project]
 name = "dartscorer"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI dart scoring system — YOLO detection + board geometry"
 requires-python = ">=3.13"
 dependencies = [
     "numpy>=2.4.2",
@@ -12,3 +12,16 @@ dependencies = [
     "sounddevice>=0.5.5",
     "ultralytics>=8.4.24",
 ]
+
+[project.scripts]
+scorer = "dartscorer.scorer:main"
+collect = "dartscorer.collect:main"
+calibrate = "dartscorer.calibrate:main"
+train = "dartscorer.train:main"
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -25,10 +25,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import cv2
 import numpy as np
-import config
-import board
-from classes_v2 import ID_TO_CLASS, parse_class_name
-from window_manager import create_window, save_window_sizes
+from dartscorer import config
+from dartscorer import board
+from dartscorer.classes_v2 import ID_TO_CLASS, parse_class_name
+from dartscorer.window_manager import create_window, save_window_sizes
 
 
 def _draw_homography_overlay(display, homography, crop_offset=(0, 0), alpha=0.4):

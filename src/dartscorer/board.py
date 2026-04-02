@@ -8,7 +8,7 @@ using WDF standard dartboard dimensions.
 import math
 import cv2
 import numpy as np
-import config
+from dartscorer import config
 
 
 def apply_homography(point, homography):
