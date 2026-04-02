@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 import config
 import board
-from classes import ID_TO_CLASS, parse_class_name
+from classes_v2 import ID_TO_CLASS, parse_class_name
 from window_manager import create_window, save_window_sizes
 
 
@@ -131,7 +131,7 @@ def load_labeled_darts(outdir):
     """Load all labeled darts from YOLO label files.
 
     Returns list of dicts:
-        {filename, image_path, darts: [{x, y, class_id, class_name, segment, ordinal}]}
+        {filename, image_path, darts: [{x, y, class_id, class_name, segment}]}
     """
     outdir = Path(outdir)
     img_dir = outdir / "images"
@@ -167,7 +167,6 @@ def load_labeled_darts(outdir):
                     "class_id": cls_id,
                     "class_name": class_name,
                     "segment": info["segment"],
-                    "ordinal": info["ordinal"],
                     "score": info["score"],
                     "label": info["label"],
                 })
@@ -215,7 +214,6 @@ def compare_all(labeled_data, homography, crop_offset=(0, 0)):
                 "predicted": predicted,
                 "match": match,
                 "sector_match": sector_match,
-                "ordinal": dart["ordinal"],
                 "actual_label": dart["label"],
             })
 
@@ -338,7 +336,7 @@ def browse_comparisons(comparisons, labeled_data, homography=None, crop_offset=(
             cv2.circle(display, (c["x"], c["y"]), 12, color, thickness)
 
             # Label
-            label = f"d{c['ordinal']} {c['actual']}"
+            label = c["actual"]
             cv2.putText(display, label, (c["x"] + 15, c["y"] - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
@@ -367,10 +365,10 @@ def browse_comparisons(comparisons, labeled_data, homography=None, crop_offset=(
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, match_color, 2)
         cp_y += 35
 
-        cv2.putText(cp, f"Actual:    d{current['ordinal']} {current['actual']}", (10, cp_y),
+        cv2.putText(cp, f"Actual:    {current['actual']}", (10, cp_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
         cp_y += 25
-        cv2.putText(cp, f"Predicted: d{current['ordinal']} {current['predicted']}", (10, cp_y),
+        cv2.putText(cp, f"Predicted: {current['predicted']}", (10, cp_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     (0, 255, 0) if current["match"] else (0, 0, 255), 1)
         cp_y += 25
@@ -421,7 +419,7 @@ def browse_comparisons(comparisons, labeled_data, homography=None, crop_offset=(
 
 def main():
     parser = argparse.ArgumentParser(description="Compare homography vs YOLO labels")
-    parser.add_argument("--outdir", default="data/training",
+    parser.add_argument("--outdir", default=str(config.DATASET_DIR),
                         help="Training data directory")
     parser.add_argument("--report", action="store_true",
                         help="Print accuracy report")
