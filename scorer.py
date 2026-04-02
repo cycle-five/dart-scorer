@@ -143,9 +143,7 @@ def main():
     if weights is None:
         # Auto-select best model for current crop resolution
         from yolo_detector import find_best_weights
-        crop_w = crop_roi[2] if crop_roi is not None else config.CAMERA_WIDTH
-        crop_h = crop_roi[3] if crop_roi is not None else config.CAMERA_HEIGHT
-        weights = find_best_weights(crop_w, crop_h)
+        weights = find_best_weights()
         if weights:
             print(f"Auto-selected model: {weights.parent.parent.name}")
 

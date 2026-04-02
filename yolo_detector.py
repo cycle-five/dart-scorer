@@ -19,7 +19,7 @@ from classes_v2 import ID_TO_CLASS, parse_class_name, NUM_CLASSES
 
 RUNS_DIR = config.PROJECT_ROOT / "runs"
 
-def find_best_weights(frame_width=None, frame_height=None):
+def find_best_weights():
     """Find the best YOLO weights.
 
     Searches runs/detect/dartscorer*/weights/best.pt, preferring the

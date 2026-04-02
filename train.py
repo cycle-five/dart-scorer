@@ -55,21 +55,22 @@ def snapshot(name, description=""):
     if results_csv.exists():
         shutil.copy2(results_csv, snap_dir / "results.csv")
 
-    # Read last line of results for metrics
+    # Read last line of results for metrics (header-based parsing)
     metrics = {}
     if results_csv.exists():
         with open(results_csv) as f:
             lines = f.readlines()
-            if lines:
-                parts = lines[-1].strip().split(",")
-                if len(parts) >= 8:
-                    metrics = {
-                        "epoch": parts[0],
-                        "precision": parts[5],
-                        "recall": parts[6],
-                        "mAP50": parts[7],
-                        "mAP50-95": parts[8] if len(parts) > 8 else "",
-                    }
+            if len(lines) >= 2:
+                header = [h.strip() for h in lines[0].strip().split(",")]
+                last = [v.strip() for v in lines[-1].strip().split(",")]
+                vals = dict(zip(header, last))
+                metrics = {
+                    "epoch": vals.get("epoch", last[0] if last else ""),
+                    "precision": vals.get("metrics/precision(B)", ""),
+                    "recall": vals.get("metrics/recall(B)", ""),
+                    "mAP50": vals.get("metrics/mAP50(B)", ""),
+                    "mAP50-95": vals.get("metrics/mAP50-95(B)", ""),
+                }
 
     meta = {
         "name": name,
@@ -135,12 +136,22 @@ def restore_snapshot(name):
         return
 
     dest_dir = RUNS_DIR / "detect" / "dartscorer" / "weights"
+    run_dir = dest_dir.parent
     dest_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(best_src, dest_dir / "best.pt")
 
-    with open(snap_dir / "meta.json") as f:
-        meta = json.load(f)
-    print(f"Restored: {meta['name']} ({meta['timestamp']})")
+    # Restore results.csv if available (needed for --info metrics)
+    snap_results = snap_dir / "results.csv"
+    if snap_results.exists():
+        shutil.copy2(snap_results, run_dir / "results.csv")
+
+    meta_path = snap_dir / "meta.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+        print(f"Restored: {meta['name']} ({meta['timestamp']})")
+    else:
+        print(f"Restored: {snap_dir.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +225,6 @@ def create_balanced_subset(outdir="data/training", samples_per_class=50):
 
     # Create balanced dataset.yaml
     bal_yaml = bal_dir / "dataset.yaml"
-    from classes import CLASS_NAMES
     lines = [
         f"# Balanced subset — {len(selected)} images",
         f"path: {bal_dir.resolve()}",
@@ -638,8 +648,14 @@ def print_info():
             print(f"    mAP50-95:   {mi.map50_95:.3f}")
 
         if mi.has_stale_best:
-            print(f"\n  NOTE: last.pt is newer than best.pt — training may have")
-            print(f"        continued past the best checkpoint.")
+            import time as _t2
+            best_time = _t2.ctime(mi.last_modified)
+            last_pt = Path(mi.weights_path).parent / "last.pt"
+            last_time = _t2.ctime(last_pt.stat().st_mtime) if last_pt.exists() else "?"
+            print(f"\n  Early stopping: best.pt is from an earlier epoch than last.pt.")
+            print(f"    best.pt saved: {best_time}")
+            print(f"    last.pt saved: {last_time}")
+            print(f"    This is normal — patience ran out without improving on the best.")
 
     print(f"\n{'=' * 60}")
     print("DATASET INFO")

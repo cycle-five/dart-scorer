@@ -28,7 +28,7 @@ for s in SECTORS:
 SEGMENTS.extend(BULLS)
 SEGMENTS.append("MISS")
 
-# Build full class list (186 classes)
+# Build full class list (189 classes = 3 ordinals × 63 segments)
 CLASS_NAMES = []
 for d in ORDINALS:
     for seg in SEGMENTS:
@@ -38,7 +38,7 @@ for d in ORDINALS:
 CLASS_TO_ID = {name: i for i, name in enumerate(CLASS_NAMES)}
 ID_TO_CLASS = {i: name for i, name in enumerate(CLASS_NAMES)}
 
-NUM_CLASSES = len(CLASS_NAMES)  # 186
+NUM_CLASSES = len(CLASS_NAMES)  # 189
 
 
 def parse_class_name(name):
