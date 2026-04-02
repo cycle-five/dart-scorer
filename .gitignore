@@ -1,5 +1,7 @@
 __pycache__/
 *.png
+*.pt
 data/
+runs/
 .omc/
 
