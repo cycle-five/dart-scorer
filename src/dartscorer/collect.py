@@ -1958,7 +1958,7 @@ def capture_only(
             frame = raw
             if lens_params is not None:
                 frame = undistort_frame(raw, *lens_params)
-            frame = apply_crop(frame, crop_roi, crop_rotation)
+            frame = apply_crop(frame, crop_roi, load_crop_rotation)
 
             if video:
                 video.update(frame)

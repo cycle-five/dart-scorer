@@ -5,12 +5,14 @@ train.py — YOLO training for dart tip detection + scoring.
 Wraps ultralytics YOLOv8 training with the dartscorer dataset.
 
 Usage:
-    python train.py                         # Train from scratch
+    python train.py                         # Train from scratch (YOLOv8s)
+    python train.py --model yolov8n         # Use nano model
+    python train.py --model yolov8m         # Use medium model
     python train.py --resume                # Resume from last checkpoint
     python train.py --weights best          # Fine-tune from best.pt
     python train.py --balanced              # Balanced pre-train then fine-tune on all
     python train.py --epochs 200            # Custom epoch count
-    python train.py --eval                  # Evaluate current model on training set
+    python train.py --eval                  # Evaluate current model on val set
     python train.py --snapshot "v1 before balanced"  # Save model snapshot
     python train.py --list-snapshots        # List saved snapshots
     python train.py --restore v1            # Restore a snapshot
@@ -158,15 +160,15 @@ def restore_snapshot(name):
 # Balanced training
 # ---------------------------------------------------------------------------
 
-def create_balanced_subset(outdir="data/training", samples_per_class=50):
+def create_balanced_subset(samples_per_class=50):
     """Create a balanced subset of the training data.
 
     Returns path to a temporary dataset.yaml for the balanced subset.
     """
-    outdir = Path(outdir)
-    img_dir = outdir / "images"
-    label_dir = outdir / "labels"
-    bal_dir = outdir / "_balanced"
+    data_dir = DATASET_YAML.parent
+    img_dir = data_dir / "images"
+    label_dir = data_dir / "labels"
+    bal_dir = data_dir / "_balanced"
     bal_img = bal_dir / "images"
     bal_lbl = bal_dir / "labels"
 
@@ -215,13 +217,17 @@ def create_balanced_subset(outdir="data/training", samples_per_class=50):
             for c in classes:
                 class_counts[c] += 1
 
-    # Copy selected files
+    # Symlink selected files
+    import os
     for stem in selected:
-        src_img = img_dir / f"{stem}.png"
+        for ext in (".png", ".jpg"):
+            src_img = img_dir / f"{stem}{ext}"
+            if src_img.exists():
+                os.symlink(src_img.resolve(), bal_img / f"{stem}{ext}")
+                break
         src_lbl = label_dir / f"{stem}.txt"
-        if src_img.exists() and src_lbl.exists():
-            shutil.copy2(src_img, bal_img / f"{stem}.png")
-            shutil.copy2(src_lbl, bal_lbl / f"{stem}.txt")
+        if src_lbl.exists():
+            os.symlink(src_lbl.resolve(), bal_lbl / f"{stem}.txt")
 
     # Create balanced dataset.yaml
     bal_yaml = bal_dir / "dataset.yaml"
@@ -246,14 +252,20 @@ def create_balanced_subset(outdir="data/training", samples_per_class=50):
     return str(bal_yaml)
 
 
-def train_balanced(epochs=100, batch=16, imgsz=640, device=None, samples_per_class=5):
+def train_balanced(epochs=100, batch=16, imgsz=640, device=None, samples_per_class=5,
+                   model_size=None):
     """Two-phase training: balanced pre-train then fine-tune on full dataset."""
     from ultralytics import YOLO
+
+    check_split_exists()
 
     print("=== Phase 1: Balanced pre-training ===")
     bal_yaml = create_balanced_subset(samples_per_class=samples_per_class)
 
-    model = YOLO("yolov8n.pt")
+    model_key = model_size or DEFAULT_MODEL
+    pretrained = YOLO_MODELS.get(model_key, f"{model_key}.pt")
+    model = YOLO(pretrained)
+    print(f"Using {model_key}")
     model.train(
         data=bal_yaml,
         epochs=epochs,
@@ -712,24 +724,51 @@ def auto_focus(n_weakest=5, **kwargs):
 # Standard training
 # ---------------------------------------------------------------------------
 
+YOLO_MODELS = {
+    "yolov8n": "yolov8n.pt",
+    "yolov8s": "yolov8s.pt",
+    "yolov8m": "yolov8m.pt",
+    "yolov8l": "yolov8l.pt",
+}
+DEFAULT_MODEL = "yolov8s"
+
+
+def check_split_exists():
+    """Check if a train/val split exists, warn if not."""
+    train_dir = DATASET_YAML.parent / "train" / "images"
+    val_dir = DATASET_YAML.parent / "val" / "images"
+    if not train_dir.exists() or not val_dir.exists():
+        print("WARNING: No train/val split found. Training and validation use the same data.")
+        print("  Run: uv run python scripts/split_dataset.py")
+        print()
+        return False
+    return True
+
+
 def train(epochs=100, batch=16, imgsz=640, resume=False, weights=None, device=None,
-          patience=20, dataset_yaml=None):
-    """Train YOLOv8 on the dartscorer dataset."""
+          patience=20, dataset_yaml=None, model_size=None):
+    """Train YOLO on the dartscorer dataset."""
     from ultralytics import YOLO
 
-    if not DATASET_YAML.exists():
-        print(f"ERROR: Dataset config not found at {DATASET_YAML}")
+    data_yaml = dataset_yaml or str(DATASET_YAML)
+    yaml_path = Path(data_yaml)
+    if not yaml_path.exists():
+        print(f"ERROR: Dataset config not found at {yaml_path}")
         sys.exit(1)
 
-    img_dir = DATASET_YAML.parent / "images"
-    label_dir = DATASET_YAML.parent / "labels"
-    n_images = len(list(img_dir.glob("*.png"))) + len(list(img_dir.glob("*.jpg")))
-    n_labels = len(list(label_dir.glob("*.txt")))
-    print(f"Dataset: {n_images} images, {n_labels} label files")
+    # Count images in train dir if split exists, otherwise in images/
+    train_img_dir = yaml_path.parent / "train" / "images"
+    if not train_img_dir.exists():
+        train_img_dir = yaml_path.parent / "images"
+    n_images = (len(list(train_img_dir.glob("*.png")))
+                + len(list(train_img_dir.glob("*.jpg"))))
+    print(f"Training images: {n_images}")
 
     if n_images == 0:
         print("ERROR: No training images found. Run collect.py first.")
         sys.exit(1)
+
+    check_split_exists()
 
     if resume:
         last_pt = RUNS_DIR / "detect" / "dartscorer" / "weights" / "last.pt"
@@ -749,11 +788,13 @@ def train(epochs=100, batch=16, imgsz=640, resume=False, weights=None, device=No
         model = YOLO(str(weights_path))
         print(f"Fine-tuning from {weights_path}")
     else:
-        model = YOLO("yolov8n.pt")
-        print("Training from pretrained YOLOv8n")
+        model_key = model_size or DEFAULT_MODEL
+        pretrained = YOLO_MODELS.get(model_key, f"{model_key}.pt")
+        model = YOLO(pretrained)
+        print(f"Training from pretrained {model_key}")
 
     train_args = dict(
-        data=str(dataset_yaml or DATASET_YAML),
+        data=data_yaml,
         epochs=epochs,
         batch=batch,
         imgsz=imgsz,
@@ -811,6 +852,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--model", type=str, default=None,
+                        choices=list(YOLO_MODELS.keys()),
+                        help=f"YOLO model size (default: {DEFAULT_MODEL})")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from last checkpoint")
     parser.add_argument("--weights", type=str, default=None,
@@ -872,6 +916,7 @@ def main():
             batch=args.batch,
             imgsz=args.imgsz,
             device=args.device,
+            model_size=args.model,
         )
     else:
         train(
@@ -882,6 +927,7 @@ def main():
             weights=args.weights,
             device=args.device,
             patience=args.patience,
+            model_size=args.model,
         )
 
 
