@@ -1883,6 +1883,45 @@ def collect_data(
 # ---------------------------------------------------------------------------
 
 
+def _run_display_prediction(yolo_model, frame, homography, crop_offset, dart_num):
+    """Run YOLO + geometry on a frame, return prediction info for display.
+
+    Returns list of (cx, cy, seg_name, confidence) tuples, or empty list.
+    """
+    try:
+        results = yolo_model.predict(frame, conf=0.15, verbose=False)
+        if not results or results[0].boxes is None:
+            return []
+
+        preds = []
+        for box in sorted(results[0].boxes, key=lambda b: float(b.conf[0]), reverse=True):
+            cls_conf = float(box.conf[0])
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+
+            # Skip duplicates
+            is_dup = any(abs(cx - px) < 30 and abs(cy - py) < 30 for px, py, _, _ in preds)
+            if is_dup:
+                continue
+
+            if homography is not None:
+                seg_name = geometry_classify(cx, cy, homography, crop_offset)
+            else:
+                seg_name = "?"
+
+            preds.append((cx, cy, seg_name or "MISS", cls_conf))
+
+        if preds:
+            for i, (_, _, seg, conf) in enumerate(preds):
+                info = parse_class_name(seg) if seg != "?" else {"label": "?"}
+                print(f"    prediction {i+1}: {info['label']} (conf={conf:.2f})")
+
+        return preds
+    except Exception as e:
+        print(f"  Prediction error: {e}")
+        return []
+
+
 def capture_only(
     outdir=None,
     use_undistort=True,
@@ -1891,11 +1930,19 @@ def capture_only(
     audio_threshold=0.7,
     video_threshold=5.0,
     settle_delay=0.7,
+    capture_delay=0.0,
 ):
     """Record frames on dart impacts. No annotation, no freezing.
 
     Just throw darts. Each impact auto-captures a settled frame.
     Press R between rounds. Images saved without labels for later annotation.
+
+    If a YOLO model exists, predictions are overlaid on the display
+    (for feedback only — nothing is saved from the prediction).
+
+    Args:
+        capture_delay: Extra seconds to wait after settling before capturing.
+                       Use this to avoid catching your hand in the frame.
     """
     global _undistort_active, _frame_resolution
     outdir = Path(outdir) if outdir else config.DATASET_DIR
@@ -1924,6 +1971,25 @@ def capture_only(
     crop_roi = load_crop_roi()
     crop_offset = (0, 0)  # homography calibrated in cropped space
 
+    # Load homography for geometry classification
+    homography = None
+    if config.BOARD_HOMOGRAPHY_PATH.exists():
+        hom_data = np.load(str(config.BOARD_HOMOGRAPHY_PATH), allow_pickle=False)
+        homography = hom_data["homography"]
+        config.apply_parallax_correction(homography)
+        print("Board homography loaded")
+
+    # Load YOLO model for prediction overlay
+    yolo_model = None
+    model_weights = config.PROJECT_ROOT / "runs" / "detect" / "dartscorer" / "weights" / "best.pt"
+    if model_weights.exists():
+        try:
+            from ultralytics import YOLO
+            yolo_model = YOLO(str(model_weights))
+            print("YOLO model loaded — predictions will be shown on display")
+        except Exception as e:
+            print(f"WARNING: Could not load YOLO model: {e}")
+
     audio = None
     video = None
     if trigger_mode == "audio":
@@ -1932,6 +1998,10 @@ def capture_only(
             audio = None
     elif trigger_mode == "video":
         video = VideoTrigger(threshold=video_threshold)
+
+    total_delay = settle_delay + capture_delay
+    if capture_delay > 0:
+        print(f"Settle: {settle_delay}s + capture delay: {capture_delay}s = {total_delay}s total")
 
     win = "Capture Mode"
     panel_win = "Control Panel"
@@ -1948,6 +2018,9 @@ def capture_only(
     settle_start = 0.0
     cooldown_start = 0.0
     darts_this_round = 0
+    last_predictions = []  # list of (cx, cy, seg_name, conf) for display
+    last_prediction_time = 0.0
+    PREDICTION_DISPLAY_SECS = 5.0  # how long to show predictions on screen
 
     try:
         while True:
@@ -1984,8 +2057,8 @@ def capture_only(
 
             elif state == UIState.SETTLING:
                 elapsed = time.monotonic() - settle_start
-                settle_remaining = max(0, settle_delay - elapsed)
-                if elapsed >= settle_delay:
+                settle_remaining = max(0, total_delay - elapsed)
+                if elapsed >= total_delay:
                     # Save frame
                     stem = make_frame_stem(frame)
                     fname = f"{stem}.png"
@@ -1999,6 +2072,13 @@ def capture_only(
                         f.write(json.dumps(entry) + "\n")
                     frame_counter += 1
                     print(f"  Captured: {fname} (dart {darts_this_round}/3)")
+
+                    # Run prediction for display overlay
+                    if yolo_model is not None:
+                        last_predictions = _run_display_prediction(
+                            yolo_model, frame, homography, crop_offset,
+                            darts_this_round)
+                        last_prediction_time = time.monotonic()
 
                     if video:
                         video.absorb(frame)
@@ -2022,16 +2102,37 @@ def capture_only(
                     if time.monotonic() - cooldown_start >= 3.0:
                         state = UIState.LISTENING
 
+            # Clear stale predictions
+            if last_predictions and (time.monotonic() - last_prediction_time > PREDICTION_DISPLAY_SECS):
+                last_predictions = []
+
             # Render
             display = frame.copy()
             h, w = display.shape[:2]
+
+            # Draw prediction overlay
+            if last_predictions:
+                for cx, cy, seg_name, conf in last_predictions:
+                    info = parse_class_name(seg_name) if seg_name not in ("?", "MISS") else {"label": seg_name}
+                    label = f"{info['label']} ({conf:.0%})"
+                    # Draw crosshair
+                    cv2.drawMarker(display, (cx, cy), (255, 200, 0), cv2.MARKER_CROSS, 20, 2)
+                    # Draw label with background
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    tx, ty = cx + 12, cy - 8
+                    cv2.rectangle(display, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 4), (0, 0, 0), -1)
+                    cv2.putText(display, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
 
             # Camera HUD
             if state == UIState.WARMUP:
                 text = f"WARMING UP... {video.warmup_remaining:.1f}s"
                 color = (100, 100, 100)
             elif state == UIState.SETTLING:
-                text = f"DART! Settling {settle_remaining:.1f}s"
+                elapsed = time.monotonic() - settle_start
+                if elapsed < settle_delay:
+                    text = f"SETTLING {settle_delay - elapsed:.1f}s"
+                else:
+                    text = f"HAND CLEAR {total_delay - elapsed:.1f}s"
                 color = (0, 200, 255)
             elif state == UIState.PULL_DARTS:
                 text = "PULL DARTS"
@@ -2135,6 +2236,11 @@ def capture_only(
                 if video:
                     video.absorb(frame)
                 print(f"  [MANUAL] {fname} (dart {darts_this_round}/3)")
+                if yolo_model is not None:
+                    last_predictions = _run_display_prediction(
+                        yolo_model, frame, homography, crop_offset,
+                        darts_this_round)
+                    last_prediction_time = time.monotonic()
             elif key == ord("p"):
                 if state == UIState.PAUSED:
                     state = paused_from or UIState.LISTENING
@@ -2482,6 +2588,8 @@ def main():
     p_capture.add_argument("--audio-threshold", type=float, default=0.7)
     p_capture.add_argument("--video-threshold", type=float, default=5.0)
     p_capture.add_argument("--settle-delay", type=float, default=0.7)
+    p_capture.add_argument("--capture-delay", type=float, default=1.5,
+                           help="Extra seconds after settling before capturing (default: 1.5, avoids hand in frame)")
 
     # Label: annotate unlabeled frames offline
     p_label = sub.add_parser("label", help="Label previously captured frames")
@@ -2499,6 +2607,7 @@ def main():
             audio_threshold=args.audio_threshold,
             video_threshold=args.video_threshold,
             settle_delay=args.settle_delay,
+            capture_delay=args.capture_delay,
         )
     elif args.mode == "label":
         label_offline(args.outdir, box_size=args.box_size)
